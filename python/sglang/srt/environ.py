@@ -458,6 +458,29 @@ class Envs:
     SGLANG_ENABLE_NVTX_SCHEDULER = EnvBool(False)
     SGLANG_ENABLE_NVTX_OPERATIONS = EnvBool(False)
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
+    # --- spec-dec-opt research knobs (see SPEC_DEC_OPT_NOTES.md) ---
+    # Spec-decode phase timing: CUDA-event GPU time per phase, dumped as json.
+    SGLANG_DEBUG_SPEC_PHASE_TIMING = EnvBool(False)
+    SGLANG_DEBUG_SPEC_PHASE_TIMING_OUT = EnvStr(None)
+    # Tree EXPAND policy. 0.0 = native fixed-top-k beam; >0 = nucleus mass cut.
+    SGLANG_SPEC_EXPAND_P = EnvFloat(0.0)
+    # Extra levels a branch survives after failing the nucleus mass cut.
+    SGLANG_SPEC_NUCLEUS_GRACE = EnvInt(0)
+    # Keep native fixed-topk expand through depth k before the nucleus cut.
+    SGLANG_SPEC_NUCLEUS_DELAY = EnvInt(0)
+    # Cap children per node (beam width stays speculative_eagle_topk). 0 = off.
+    SGLANG_SPEC_EXPAND_CHILDREN = EnvInt(0)
+    # Accumulate tree path scores as summed log-probs (avoids underflow).
+    SGLANG_SPEC_ENABLE_LOG_DOMAIN = EnvBool(False)
+    # Log depth of the verify nodes kept by the global rerank.
+    SGLANG_DEBUG_SPEC_TREE_DEPTH = EnvBool(False)
+    SGLANG_DEBUG_SPEC_TREE_DEPTH_OUT = EnvStr(None)
+    # Upcast draft logits to fp32 before softmax during tree expansion.
+    SGLANG_SPEC_DRAFT_FP32_SOFTMAX = EnvBool(False)
+    # Depth-normalized rerank: score / depth^alpha. 0.0 = off.
+    SGLANG_SPEC_DEPTH_ALPHA = EnvFloat(0.0)
+    # Verify only the single best branch (chain) of a wide tree. Ablation only.
+    SGLANG_SPEC_ENABLE_SINGLE_BRANCH_VERIFY = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
     # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE (single combined trace) takes

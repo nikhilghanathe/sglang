@@ -98,7 +98,10 @@ def get_req_to_token_extra_context_len() -> int:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         spec_algo = SpeculativeAlgorithm.from_string(spec_algorithm)
-        if page_size > 1 or spec_algo.is_uno():
+        # spec-dec-opt: also reserve for tree drafting (topk > 1) at page_size 1.
+        # Deep/wide EAGLE trees at page 1 otherwise overrun the row headroom.
+        spec_topk = get_spec().speculative_eagle_topk or 1
+        if page_size > 1 or spec_algo.is_uno() or spec_topk > 1:
             # UNO's double-buffer reserve applies at every page size. Larger
             # pages may additionally round the allocation up by page_size - 1.
             extra = max(extra, get_alloc_reserve_per_decode() + page_size - 1)

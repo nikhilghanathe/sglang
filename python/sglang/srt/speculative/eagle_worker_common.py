@@ -17,6 +17,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative import spec_phase_timer
 from sglang.srt.speculative.eagle_utils import (
     TreeMaskMode,
     build_tree_kernel_efficient,
@@ -364,27 +365,28 @@ def build_eagle_verify_input(
         else:
             seq_lens_sum = bs * target_attn_backend.max_context_len
 
-    (
-        tree_mask,
-        position,
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        draft_tokens,
-    ) = build_tree_kernel_efficient(
-        draft_input.bonus_tokens,
-        parent_list,
-        top_scores_index,
-        draft_tokens,
-        batch.seq_lens,
-        seq_lens_sum,
-        topk,
-        num_steps,
-        num_draft_tokens,
-        mask_mode,
-        tree_mask_buf,
-        fill_prefix_mask=fill_mask,
-    )
+    with spec_phase_timer.record("tree_build"):
+        (
+            tree_mask,
+            position,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            draft_input.bonus_tokens,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            batch.seq_lens,
+            seq_lens_sum,
+            topk,
+            num_steps,
+            num_draft_tokens,
+            mask_mode,
+            tree_mask_buf,
+            fill_prefix_mask=fill_mask,
+        )
 
     return EagleVerifyInput(
         draft_token=draft_tokens,
@@ -566,12 +568,13 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    forward_batch_output = target_worker.forward_batch_generation(
-        batch=None,
-        forward_batch=verify_forward_batch,
-        is_verify=True,
-        pp_proxy_tensors=pp_proxy_tensors,
-    )
+    with spec_phase_timer.record("target_forward"):
+        forward_batch_output = target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding
@@ -588,17 +591,18 @@ def run_eagle_verify(
     # Sample
     maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
     maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-    (
-        predict,
-        accept_lens,
-        accept_index,
-    ) = eagle_sample(
-        verify_input,
-        batch,
-        logits_output,
-        grammar_mask,
-        uno_target_max_top_k=uno_target_max_top_k,
-    )
+    with spec_phase_timer.record("accept"):
+        (
+            predict,
+            accept_lens,
+            accept_index,
+        ) = eagle_sample(
+            verify_input,
+            batch,
+            logits_output,
+            grammar_mask,
+            uno_target_max_top_k=uno_target_max_top_k,
+        )
     new_seq_lens = batch.seq_lens + accept_lens
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),

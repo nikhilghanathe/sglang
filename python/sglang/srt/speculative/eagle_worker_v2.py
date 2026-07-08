@@ -72,6 +72,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     SpecRuntimeState,
 )
 from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
+from sglang.srt.speculative import spec_phase_timer
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.dp_spec_prefill_coordination import (
     DPSpecPrefillCoordinationPlan,
@@ -639,7 +640,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        with canary_outside_ctx:
+        with canary_outside_ctx, spec_phase_timer.record("draft"):
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -741,6 +742,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Forward multiple steps
         scores = None
+        grace_left = None  # nucleus grace-window state; unused unless SGLANG_SPEC_NUCLEUS_GRACE>0
         with IndexTopKShareState.mtp_iteration(
             forward_batch,
             enabled=self.index_share_for_mtp_iteration,
@@ -751,8 +753,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     input_ids = topk_index.flatten()
                 else:
                     input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                        i, topk_p, topk_index, hidden_states, scores, self.topk
+                        i, topk_p, topk_index, hidden_states, scores, self.topk,
+                        grace_left,
                     )
+                    grace_left = tree_info[3] if len(tree_info) > 3 else None
                     score_list.append(tree_info[0])
                     token_list.append(tree_info[1])
                     parents_list.append(tree_info[2])
