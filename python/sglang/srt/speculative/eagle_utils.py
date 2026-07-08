@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from enum import IntEnum
 from typing import TYPE_CHECKING, List, Optional
@@ -12,6 +13,7 @@ from sglang.srt.mem_cache.common import (
     get_alloc_reserve_per_decode,
     get_last_loc,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
@@ -32,6 +34,79 @@ if _is_cuda or _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+
+_SPEC_DEPTH_ALPHA: float = envs.SGLANG_SPEC_DEPTH_ALPHA.get()
+if _SPEC_DEPTH_ALPHA != 0.0:
+    logging.getLogger(__name__).warning(
+        "[spec] depth-normalized rerank ACTIVE: SGLANG_SPEC_DEPTH_ALPHA=%.3f "
+        "(score/depth^alpha; ancestor-closure repaired post-topk)",
+        _SPEC_DEPTH_ALPHA,
+    )
+
+_SPEC_ENABLE_SINGLE_BRANCH_VERIFY: bool = (
+    envs.SGLANG_SPEC_ENABLE_SINGLE_BRANCH_VERIFY.get()
+)
+if _SPEC_ENABLE_SINGLE_BRANCH_VERIFY:
+    logging.getLogger(__name__).warning(
+        "[spec] single-branch verify ACTIVE: SGLANG_SPEC_ENABLE_SINGLE_BRANCH_VERIFY=1 "
+        "(global rerank keeps only the single highest-value branch; target verifies "
+        "one plain chain, not the tree)"
+    )
+
+# ---- debug: verify-budget depth allocation (SGLANG_DEBUG_SPEC_TREE_DEPTH) --------------
+# Accumulate a {depth: count} histogram of the nodes the global rerank keeps, so we can
+# see whether the B verify nodes go shallow-bushy or deep-narrow vs the pt_tree harness.
+_DEPTH_HIST: dict = {}
+_DEPTH_CALLS = 0
+
+
+def _record_retained_depths(top_scores_index: torch.Tensor, topk: int, nlevels: int):
+    """top_scores_index: (b, B-1) indices into the flattened score_list. Map each to its
+    tree depth and fold into a global histogram; dump incrementally (worker is a subprocess).
+    Flattened layout after cat+flatten(1): dim1 has 1 + topk*(nlevels-1) rows (row 0 = depth 1,
+    then topk rows per subsequent level), each row topk wide -> col c has row = c // topk."""
+    global _DEPTH_CALLS
+    if topk <= 0:
+        return
+    # This does D2H syncs (.tolist) + dynamic-shape ops (unique) — both illegal while a CUDA
+    # graph is capturing, and during graph *replay* this Python never runs. So it only yields
+    # real data in eager mode (--disable-cuda-graph); skip entirely under capture to be safe.
+    if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        return
+    idx = top_scores_index.reshape(-1)
+    row = torch.div(idx, topk, rounding_mode="floor")
+    depth = torch.where(row == 0, row.new_ones(()), torch.div(row - 1, topk, rounding_mode="floor") + 2)
+    vals, counts = torch.unique(depth, return_counts=True)
+    for v, c in zip(vals.tolist(), counts.tolist()):
+        _DEPTH_HIST[v] = _DEPTH_HIST.get(v, 0) + int(c)
+    _DEPTH_CALLS += 1
+    if _DEPTH_CALLS % 32 == 0:
+        _dump_retained_depths()
+
+
+def _dump_retained_depths():
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+            return
+    except Exception:
+        pass
+    out = envs.SGLANG_DEBUG_SPEC_TREE_DEPTH_OUT.get()
+    if not out:
+        return
+    tot = sum(_DEPTH_HIST.values()) or 1
+    mean_depth = sum(d * c for d, c in _DEPTH_HIST.items()) / tot
+    try:
+        import json
+
+        with open(out, "w") as f:
+            json.dump(
+                {"calls": _DEPTH_CALLS, "mean_retained_depth": mean_depth,
+                 "hist": {str(d): _DEPTH_HIST[d] for d in sorted(_DEPTH_HIST)}}, f)
+    except Exception:
+        pass
 
 
 def per_step_draft_out_cache_loc(
@@ -74,25 +149,177 @@ def _eagle_prefill_tail_tokens(
     return tail_tokens
 
 
+def _enforce_ancestor_closure(
+    top_scores_index: torch.Tensor,
+    parent_list: torch.Tensor,
+    rerank_scores: torch.Tensor,
+    topk: int,
+    nlevels: int,
+) -> torch.Tensor:
+    """Repair the top-B selection to be ancestor-closed — pure GPU tensor ops.
+
+    Depth normalization can select a deep node whose parent was not selected
+    (child normalized score > parent normalized score for easy tokens). The CUDA
+    tree kernel requires every selected node's parent to also be selected.
+
+    parent_list encoding (from the CUDA kernel): parent of flat index p is
+    parent_list[b, p // topk].  Row 0 maps to -1 (root = bonus token, always
+    valid). Rows 1.. map to flat indices of depth-1, depth-2, ... parents.
+
+    Phase 1 — add missing parents: up to nlevels passes, each pass finds all
+    selected nodes whose parent is absent and scatter-adds the parents into the
+    selection mask.  No GPU→CPU sync (no .any() branch).
+    Phase 2 — trim excess: remove the lowest-scoring leaves (nodes not
+    referenced as parents) until the count is back to B-1.  Also no sync.
+    """
+    b, B_minus_1 = top_scores_index.shape
+    total = rerank_scores.shape[1]
+    device = top_scores_index.device
+
+    # parent_flat_all[b, p] = parent_list[b, p // topk] — parent flat index for every node
+    all_pos = torch.arange(total, device=device)
+    parent_flat_all = parent_list[:, all_pos // topk]  # (b, total)
+    parent_flat_clamped = parent_flat_all.clamp(min=0)  # -1 → 0 (harmless sentinel)
+    is_root_child = parent_flat_all < 0  # depth-1 nodes whose parent is the bonus token
+
+    # Represent the current selection as a bool mask (b, total)
+    sel_mask = torch.zeros(b, total, dtype=torch.bool, device=device)
+    sel_mask.scatter_(1, top_scores_index, True)
+
+    # Pre-allocate scratch tensors reused across iterations
+    add_count = torch.zeros(b, total, dtype=torch.long, device=device)
+    in_use = torch.zeros(b, total, dtype=torch.long, device=device)
+
+    # Phase 1: add missing ancestors (up to nlevels passes, no CPU sync)
+    for _ in range(nlevels):
+        parent_in_sel = sel_mask.gather(1, parent_flat_clamped)
+        violators = sel_mask & ~is_root_child & ~parent_in_sel
+        # scatter_add_ to parents of violators; non-violators point to position 0
+        # (harmless: position-0 nodes are depth-1 root children, already valid)
+        add_count.fill_(0)
+        add_count.scatter_add_(
+            1,
+            torch.where(violators, parent_flat_clamped, torch.zeros_like(parent_flat_clamped)),
+            violators.long(),
+        )
+        sel_mask = sel_mask | add_count.bool()
+
+    # Phase 2: trim excess back to B-1 (at most nlevels passes, no CPU sync)
+    for _ in range(nlevels):
+        # A leaf is a selected node that is not the parent of any other selected node
+        in_use.fill_(0)
+        in_use.scatter_add_(
+            1,
+            torch.where(
+                sel_mask & ~is_root_child,
+                parent_flat_clamped,
+                torch.zeros_like(parent_flat_clamped),
+            ),
+            (sel_mask & ~is_root_child).long(),
+        )
+        is_leaf = sel_mask & (in_use == 0)
+
+        # needs_trim[b] is True when that batch item still has excess nodes
+        needs_trim = sel_mask.long().sum(dim=1) > B_minus_1  # (b,)
+
+        # For items that need trimming, find the lowest-scoring leaf; for others
+        # point to position 0 (will produce a spurious remove masked out below)
+        leaf_scores = torch.where(
+            is_leaf & needs_trim.unsqueeze(1),
+            rerank_scores,
+            rerank_scores.new_full((), float("inf")),
+        )
+        worst_leaf = leaf_scores.argmin(dim=1)  # (b,)
+
+        remove = torch.zeros(b, total, dtype=torch.bool, device=device)
+        remove.scatter_(1, worst_leaf.unsqueeze(1), needs_trim.unsqueeze(1))
+        sel_mask = sel_mask & ~remove
+
+    # Convert the repaired mask back to sorted indices
+    _, top_scores_index_new = sel_mask.float().topk(B_minus_1, dim=1, sorted=False)
+    return torch.sort(top_scores_index_new).values
+
+
+def _select_single_branch(
+    rerank_scores: torch.Tensor,
+    last_level_width: int,
+    parent_list: torch.Tensor,
+    topk: int,
+    nlevels: int,
+) -> torch.Tensor:
+    """Restrict the global rerank to the SINGLE highest-value branch (one node
+    per level) instead of the top-(B-1) nodes anywhere in the tree. Lets the
+    draft EXPAND wide (topk>1) while VERIFY only ever sees a plain chain: the
+    target does standard (non-tree) speculative verification over one
+    candidate sequence, not a tree-masked forward over many.
+
+    The single best branch is the ancestor chain of the highest-scoring node
+    at the FINAL expand level. This is provably the true best-value path end
+    to end: value is non-increasing along any path, and every expand step's
+    fast_topk already performs a value-sorted cut across the FLATTENED
+    (all-parents-pooled) candidates -- so the running max-score node is always
+    carried into the next level's frontier, and no other branch's descendant
+    can ever overtake it later. Returns (b, nlevels) sorted indices -- exactly
+    fills a nlevels-1 draft-token budget (see the num_draft_token assert at
+    the call site), no padding needed."""
+    b, total = rerank_scores.shape
+    device = rerank_scores.device
+
+    offset = total - last_level_width
+    leaf = offset + rerank_scores[:, offset:].argmax(dim=1)  # (b,) global flat index
+
+    # parent_flat_all[b, p] = flat index of p's parent (or <0 sentinel for a
+    # depth-1 / root-child node) -- same lookup `_enforce_ancestor_closure` uses.
+    # nlevels==1 has no ancestor table at all (parent_list is empty): every
+    # candidate is trivially a root child, so skip the lookup entirely.
+    if parent_list.numel() > 0:
+        all_pos = torch.arange(total, device=device)
+        parent_flat_all = parent_list[:, all_pos // topk]  # (b, total)
+        is_root_child = parent_flat_all < 0
+        parent_flat_clamped = parent_flat_all.clamp(min=0)
+    else:
+        is_root_child = torch.ones(b, total, dtype=torch.bool, device=device)
+        parent_flat_clamped = torch.zeros(b, total, dtype=torch.long, device=device)
+
+    sel_mask = torch.zeros(b, total, dtype=torch.bool, device=device)
+    cur = leaf
+    for _ in range(nlevels):
+        sel_mask.scatter_(1, cur.unsqueeze(1), True)
+        at_root = is_root_child.gather(1, cur.unsqueeze(1)).squeeze(1)
+        parent = parent_flat_clamped.gather(1, cur.unsqueeze(1)).squeeze(1)
+        cur = torch.where(at_root, cur, parent)
+
+    _, top_scores_index = sel_mask.float().topk(nlevels, dim=1, sorted=False)
+    return torch.sort(top_scores_index).values
+
+
 def organize_draft_results(
     score_list: List[torch.Tensor],
     token_list: List[torch.Tensor],
     parents_list: List[torch.Tensor],
     num_draft_token: int,
 ):
-    score_list = torch.cat(score_list, dim=1).flatten(1)
+    # topk per step = last dim of the level-0 score entry (b, 1, topk).
+    _dbg_topk = score_list[0].shape[-1] if score_list else 0
+    _dbg_nlevels = len(score_list)
+    if _SPEC_DEPTH_ALPHA != 0.0:
+        # Depth-normalize: divide each level's cumulative score by depth^alpha.
+        # score_list[i] covers depth (i+1) nodes. Dividing rewards deeper paths
+        # whose raw cumulative score is suppressed by the length of the chain.
+        # In log domain (SGLANG_SPEC_ENABLE_LOG_DOMAIN=1) with alpha=1 this is
+        # the average log-prob per step (geometric mean), giving each depth equal
+        # standing in the global rerank. The indices into ss_token_list are
+        # unchanged — only the ranking key changes.
+        rerank_scores = torch.cat(
+            [s / ((i + 1) ** _SPEC_DEPTH_ALPHA) for i, s in enumerate(score_list)],
+            dim=1,
+        ).flatten(1)
+    else:
+        rerank_scores = torch.cat(score_list, dim=1).flatten(1)
     ss_token_list = torch.cat(token_list, dim=1)
-    top_scores = torch.topk(score_list, num_draft_token - 1, dim=-1)
-    top_scores_index = top_scores.indices
-    top_scores_index = torch.sort(top_scores_index).values
-    maybe_detect_oob(
-        top_scores_index,
-        0,
-        ss_token_list.shape[1],
-        "organize_draft_results: top_scores_index OOB for gather on ss_token_list",
-    )
-    draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
+    # Build parent_list up front -- both the ancestor-closure repair and
+    # single-branch selection need the ancestor-lookup table.
     if len(parents_list) > 1:
         parent_list = torch.cat(parents_list[:-1], dim=1)
     else:
@@ -100,6 +327,41 @@ def organize_draft_results(
         parent_list = torch.empty(
             batch_size, 0, dtype=torch.long, device=parents_list[0].device
         )
+
+    if _SPEC_ENABLE_SINGLE_BRANCH_VERIFY:
+        assert num_draft_token - 1 == _dbg_nlevels, (
+            "SGLANG_SPEC_ENABLE_SINGLE_BRANCH_VERIFY requires "
+            "speculative_num_draft_tokens == speculative_num_steps + 1 (the single "
+            f"chosen branch has exactly one node per level), got num_draft_token="
+            f"{num_draft_token} speculative_num_steps={_dbg_nlevels}"
+        )
+        last_level_width = score_list[-1].flatten(1).shape[1]
+        top_scores_index = _select_single_branch(
+            rerank_scores, last_level_width, parent_list, _dbg_topk, _dbg_nlevels
+        )
+    else:
+        top_scores = torch.topk(rerank_scores, num_draft_token - 1, dim=-1)
+        top_scores_index = top_scores.indices
+        top_scores_index = torch.sort(top_scores_index).values
+
+        # Depth normalization can select deep nodes whose parent was not selected
+        # (child normalized score > parent normalized score for easy tokens). Fix
+        # before passing to the CUDA tree kernel which requires ancestor-closure.
+        if _SPEC_DEPTH_ALPHA != 0.0 and parent_list.numel() > 0:
+            top_scores_index = _enforce_ancestor_closure(
+                top_scores_index, parent_list, rerank_scores, _dbg_topk, _dbg_nlevels
+            )
+            top_scores_index = torch.sort(top_scores_index).values
+
+    if envs.SGLANG_DEBUG_SPEC_TREE_DEPTH.get():
+        _record_retained_depths(top_scores_index, _dbg_topk, _dbg_nlevels)
+    maybe_detect_oob(
+        top_scores_index,
+        0,
+        ss_token_list.shape[1],
+        "organize_draft_results: top_scores_index OOB for gather on ss_token_list",
+    )
+    draft_tokens = torch.gather(ss_token_list, index=top_scores_index, dim=1)
 
     return parent_list, top_scores_index, draft_tokens
 

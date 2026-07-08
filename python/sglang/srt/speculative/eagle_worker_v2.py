@@ -51,6 +51,7 @@ from sglang.srt.speculative.adaptive_runtime_state import (
     AdaptiveController,
     SpecRuntimeState,
 )
+from sglang.srt.speculative import spec_phase_timer
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_utils import DraftBackendFactory
 from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
@@ -495,7 +496,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        with canary_outside_ctx:
+        with canary_outside_ctx, spec_phase_timer.record("draft"):
             # Run draft
             if can_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
@@ -540,27 +541,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 # tree_mask_buf preallocated -> kernel ignores seq_lens_sum.
                 seq_lens_sum = 0
 
-        (
-            tree_mask,
-            position,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            draft_tokens,
-        ) = build_tree_kernel_efficient(
-            draft_input.bonus_tokens,
-            parent_list,
-            top_scores_index,
-            draft_tokens,
-            batch.seq_lens,
-            seq_lens_sum,
-            self.topk,
-            self.speculative_num_steps,
-            self.speculative_num_draft_tokens,
-            self.tree_mask_mode,
-            tree_mask_buf,
-            position_buf,
-        )
+        with spec_phase_timer.record("tree_build"):
+            (
+                tree_mask,
+                position,
+                retrieve_index,
+                retrieve_next_token,
+                retrieve_next_sibling,
+                draft_tokens,
+            ) = build_tree_kernel_efficient(
+                draft_input.bonus_tokens,
+                parent_list,
+                top_scores_index,
+                draft_tokens,
+                batch.seq_lens,
+                seq_lens_sum,
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+                self.tree_mask_mode,
+                tree_mask_buf,
+                position_buf,
+            )
 
         return EagleVerifyInput(
             draft_token=draft_tokens,
@@ -610,13 +612,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Forward multiple steps
         scores = None
+        grace_left = None  # nucleus grace-window state; unused unless SGLANG_SPEC_NUCLEUS_GRACE>0
         if self.index_share_for_mtp_iteration:
             forward_batch.reuse_mtp_topk_indices = True
             forward_batch.topk_indices = None
         for i in range(self.speculative_num_steps):
             input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
+                i, topk_p, topk_index, hidden_states, scores, self.topk, grace_left
             )
+            grace_left = tree_info[3] if len(tree_info) > 3 else None
             score_list.append(tree_info[0])
             token_list.append(tree_info[1])
             parents_list.append(tree_info[2])
@@ -1508,11 +1512,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # eagle_prepare_for_verify marked the batch in exactly that case; the
         # non-cuda-graph path stays unmarked and gets forward_extend's init
         # (post-pad).
-        forward_batch_output = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-        )
+        with spec_phase_timer.record("target_forward"):
+            forward_batch_output = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+            )
         logits_output = forward_batch_output.logits_output
 
         # Generate vocab mask for constrained decoding
@@ -1538,11 +1543,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Sample
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         maybe_detect_inf(logits_output.next_token_logits, "verify: target model logits")
-        (
-            predict,
-            accept_lens,
-            accept_index,
-        ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
+        with spec_phase_timer.record("accept"):
+            (
+                predict,
+                accept_lens,
+                accept_index,
+            ) = eagle_sample(verify_input, batch, logits_output, vocab_mask)
         new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification

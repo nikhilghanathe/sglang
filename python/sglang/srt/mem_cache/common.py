@@ -265,7 +265,6 @@ def get_req_to_token_extra_context_len(server_args: ServerArgs) -> int:
     extra = 4 + (server_args.max_speculative_num_draft_tokens or 0)
     if (
         server_args.speculative_algorithm is not None
-        and server_args.page_size > 1
         and (server_args.speculative_eagle_topk or 1) > 1
     ):
         extra = max(extra, get_alloc_reserve_per_decode(server_args))

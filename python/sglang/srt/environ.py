@@ -280,6 +280,83 @@ class Envs:
     )
     SGLANG_RECORD_STEP_TIME = EnvBool(False)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
+    # Spec-decode phase timing (offline benchmarking). When on, the spec worker
+    # records CUDA-event GPU time per phase (draft/target_forward/tree_build/accept)
+    # and dumps per-phase total ms + step counts to the json path below at process
+    # exit. Worker runs in a subprocess, so the file is how timing reaches the bench.
+    SGLANG_DEBUG_SPEC_PHASE_TIMING = EnvBool(False)
+    SGLANG_DEBUG_SPEC_PHASE_TIMING_OUT = EnvStr(None)
+    # Speculative decoding — experimental tree EXPAND policy (ported from the offline
+    # pt_tree harness). 0.0 = native fixed-top-k expand beam (EAGLE-2 fixed width).
+    # >0 = nucleus "controlled-expand": each draft step keeps the minimal beam covering
+    # this fraction of path-prob mass, capped at speculative_eagle_topk (pt_tree rerank-p).
+    SGLANG_SPEC_EXPAND_P = EnvFloat(0.0)
+    # Speculative decoding — nucleus grace window (pt_tree port). Nucleus's per-level
+    # mass cut is memoryless: a branch that falls below the mass threshold has its
+    # score masked (dropped) immediately, and its children score ~-inf starting the
+    # VERY NEXT level — one bad level kills a branch for good, even if it would have
+    # recovered into a confident, correct continuation a token or two later.
+    # SGLANG_SPEC_NUCLEUS_GRACE=k gives a branch that fails the mass cut k MORE levels
+    # of protection (real score keeps flowing) before it's actually masked. A branch
+    # that passes the mass cut again while still in its grace window has its budget
+    # refilled to k (healthy again). 0 = disabled (native nucleus, immediate death).
+    # Only takes effect when SGLANG_SPEC_EXPAND_P > 0 (nucleus mode).
+    SGLANG_SPEC_NUCLEUS_GRACE = EnvInt(0)
+    # Speculative decoding — delayed nucleus onset. Nucleus's mass cut applies from
+    # the very first expand step, right where disagreement/uncertainty across
+    # candidates is highest (the "gate" near the root). SGLANG_SPEC_NUCLEUS_DELAY=k
+    # keeps native fixed-topk expand (no mass cut) through depth k, and only starts
+    # the nucleus mass cut from depth k+1 onward -- guaranteeing full-width
+    # exploration near the root before reallocating budget toward the spine. 0 =
+    # disabled (native nucleus, mass cut from depth 2 on). Only takes effect when
+    # SGLANG_SPEC_EXPAND_P > 0 (nucleus mode). Depth 1 (the root's own children,
+    # `_select_top_k_tokens_first`) is always native regardless of this setting.
+    SGLANG_SPEC_NUCLEUS_DELAY = EnvInt(0)
+    # Speculative decoding — DECOUPLE the expand beam width from the per-node branching
+    # factor (children/node). Natively speculative_eagle_topk sets BOTH: at each step every
+    # one of the `topk` frontier nodes spawns `topk` children (topk^2 candidates) and the
+    # top-`topk` lines are carried. pt_tree's EAGLE-2 keeps these separate — a wide value
+    # beam (W) over narrow branching (children/node), e.g. W=16 beam, 8 children. Set this to
+    # k>0 to cap each node to its top-k children (beam width stays speculative_eagle_topk):
+    # children beyond k get a drop sentinel so they neither seed the beam nor enter the global
+    # rerank verify pool. 0 = disabled (children = speculative_eagle_topk, native behavior).
+    # Only the expansion steps (i>=1) are capped; the root still seeds the full beam.
+    SGLANG_SPEC_EXPAND_CHILDREN = EnvInt(0)
+    # Speculative decoding — accumulate tree path scores in log domain (sum of log-probs)
+    # instead of the native product of probs. Off by default (shallow EAGLE trees don't
+    # underflow). Turn on for deep trees (large speculative_num_steps): the product
+    # underflows toward 0 and the global rerank degenerates. The score is a pure ranking
+    # key (topk only), so log is a monotonic transform — identical selection, no underflow.
+    SGLANG_SPEC_ENABLE_LOG_DOMAIN = EnvBool(False)
+    # Debug: log the depth of the B verify nodes the global rerank keeps (organize_draft_results)
+    # — shows how the verify budget is allocated across tree depth (shallow-bushy vs deep-narrow),
+    # for comparison against the offline pt_tree harness. Accumulated + dumped to the json path.
+    SGLANG_DEBUG_SPEC_TREE_DEPTH = EnvBool(False)
+    SGLANG_DEBUG_SPEC_TREE_DEPTH_OUT = EnvStr(None)
+    # Upcast draft logits to float32 before softmax during tree expansion. bf16 logits produce
+    # a flatter distribution (more competing alternatives at shallow depths), which fills the
+    # top-B verify budget with shallow nodes and crowds out deep canonical paths. float32 gives
+    # sharper probabilities, matching the HF/vLLM offline harness behaviour. Diagnostic only.
+    SGLANG_SPEC_DRAFT_FP32_SOFTMAX = EnvBool(False)
+    # Speculative decoding — depth-normalized global rerank. Score each candidate
+    # node by (cumulative_score / depth^alpha) instead of raw cumulative score.
+    # With alpha=1.0 in log domain (SGLANG_SPEC_ENABLE_LOG_DOMAIN=1) this is the
+    # average log-prob per step (geometric mean), which gives equal footing to all
+    # depths.  0.0 = disabled (native cumulative score). Combine with
+    # SGLANG_SPEC_ENABLE_LOG_DOMAIN=1 for correct level normalization.
+    SGLANG_SPEC_DEPTH_ALPHA = EnvFloat(0.0)
+    # Speculative decoding — single-branch verify (pt_tree ablation). Let the draft
+    # EXPAND wide (speculative_eagle_topk > 1) as usual, but restrict the global
+    # rerank to the SINGLE highest-value branch (one node per level) instead of the
+    # top-(B-1) nodes anywhere in the tree. The target then verifies one plain
+    # chain (standard, non-tree speculative decoding) instead of a tree-masked
+    # multi-branch forward. Answers: how much of the tree's acceptance-length win
+    # is the tree-verify (checking many branches in one pass) vs. just picking a
+    # better single sequence out of a wider search? Requires
+    # speculative_num_draft_tokens == speculative_num_steps + 1 (the chosen branch
+    # has exactly one node per level — no slack budget to pad with). Off by default
+    # (native multi-branch global rerank).
+    SGLANG_SPEC_ENABLE_SINGLE_BRANCH_VERIFY = EnvBool(False)
     SGLANG_FORCE_SHUTDOWN = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)

@@ -52,6 +52,66 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_musa = is_musa()
 
+# Experimental tree EXPAND policy (pt_tree port). 0.0 = native fixed-top-k beam.
+# >0 = nucleus controlled-expand (keep minimal beam covering this path-prob mass each
+# step, capped at eagle_topk). Read once at import; the worker subprocess inherits the
+# env from the benchmark. See SGLANG_SPEC_EXPAND_P in environ.py.
+_SPEC_EXPAND_P = float(envs.SGLANG_SPEC_EXPAND_P.get() or 0.0)
+if _SPEC_EXPAND_P > 0.0:
+    logging.getLogger(__name__).warning(
+        "[spec] nucleus controlled-expand ACTIVE: SGLANG_SPEC_EXPAND_P=%.3f", _SPEC_EXPAND_P
+    )
+
+# Nucleus grace window: protect a branch that just failed the mass cut for k more
+# levels before actually masking it. Only meaningful when nucleus is active. See
+# SGLANG_SPEC_NUCLEUS_GRACE in environ.py.
+_SPEC_NUCLEUS_GRACE = int(envs.SGLANG_SPEC_NUCLEUS_GRACE.get() or 0)
+if _SPEC_NUCLEUS_GRACE > 0 and _SPEC_EXPAND_P > 0.0:
+    logging.getLogger(__name__).warning(
+        "[spec] nucleus grace window ACTIVE: SGLANG_SPEC_NUCLEUS_GRACE=%d "
+        "(branches under the mass cut survive %d extra level(s) before dropping)",
+        _SPEC_NUCLEUS_GRACE, _SPEC_NUCLEUS_GRACE,
+    )
+
+# Delayed nucleus onset: keep native fixed-topk expand (full width, no mass cut)
+# through depth k, only starting the nucleus mass cut from depth k+1 on. Guarantees
+# full exploration near the root/gate before reallocating budget toward the spine.
+# Only meaningful when nucleus is active. See SGLANG_SPEC_NUCLEUS_DELAY in environ.py.
+_SPEC_NUCLEUS_DELAY = int(envs.SGLANG_SPEC_NUCLEUS_DELAY.get() or 0)
+if _SPEC_NUCLEUS_DELAY > 0 and _SPEC_EXPAND_P > 0.0:
+    logging.getLogger(__name__).warning(
+        "[spec] nucleus delayed onset ACTIVE: SGLANG_SPEC_NUCLEUS_DELAY=%d "
+        "(native fixed-topk expand through depth %d, nucleus mass cut from depth %d on)",
+        _SPEC_NUCLEUS_DELAY, _SPEC_NUCLEUS_DELAY, _SPEC_NUCLEUS_DELAY + 1,
+    )
+
+# Decouple the per-node branching factor (children/node) from the expand beam width.
+# 0 = disabled (children = eagle_topk = beam width, native EAGLE-2). k>0 caps each node to
+# its top-k children so a WIDE beam can explore over NARROW branching (pt_tree W>children).
+# Only the expansion steps are capped; the root still seeds the full beam. See environ.py.
+_SPEC_EXPAND_CHILDREN = int(envs.SGLANG_SPEC_EXPAND_CHILDREN.get() or 0)
+if _SPEC_EXPAND_CHILDREN > 0:
+    logging.getLogger(__name__).warning(
+        "[spec] decoupled branching ACTIVE: SGLANG_SPEC_EXPAND_CHILDREN=%d "
+        "(children/node; beam width stays speculative_eagle_topk)",
+        _SPEC_EXPAND_CHILDREN,
+    )
+
+# Accumulate tree path scores as a sum of log-probs instead of a product of probs.
+# The score is only a ranking key (topk), so log is a monotonic transform: identical
+# selection to product domain but no underflow on deep trees (large num_steps). Read
+# once at import; the worker subprocess inherits the env. See environ.py.
+_SPEC_LOG_DOMAIN = bool(envs.SGLANG_SPEC_ENABLE_LOG_DOMAIN.get())
+# clamp floor for log(prob): avoids log(0) = -inf; ~smallest normal float32.
+_LOG_PROB_FLOOR = 1e-30
+# "dropped beam" sentinel in log domain (product-domain uses 0.0). Far below any real
+# cumulative log-prob so the node and its children sort last in the global rerank.
+_LOG_DROP = -1e30
+if _SPEC_LOG_DOMAIN:
+    logging.getLogger(__name__).warning(
+        "[spec] log-domain score accumulation ACTIVE: SGLANG_SPEC_ENABLE_LOG_DOMAIN=1"
+    )
+
 if TYPE_CHECKING:
     from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -88,6 +148,11 @@ def renorm_draft_probs(
     Plain softmax, except under rejection sampling where logits are
     temperature-scaled so the draft proposal q tracks the target sampling
     temperature (higher acceptance; correctness holds for any q).
+
+    SGLANG_SPEC_DRAFT_FP32_SOFTMAX=1: upcast logits to float32 before softmax.
+    bf16 logits produce a flatter distribution (stronger competing branches at
+    shallow depths fill the top-B verify budget and crowd out deep canonical
+    paths). float32 sharpens the distribution, matching pt_tree's HF behaviour.
     """
     if not use_rejection_sampling or not next_token_logits.size(0):
         return torch.softmax(next_token_logits, dim=-1)
@@ -202,24 +267,77 @@ def create_num_accept_tokens_filter(
     return num_accept_tokens_filter
 
 
+def _cap_children(
+    expand_scores: torch.Tensor, topk: int, children: int, log_domain: bool
+):
+    """Cap each node's branching to its top-`children` children (beam width unchanged).
+
+    expand_scores is (b, topk_beam, topk_children); the child dim is descending
+    (topk_p came from fast_topk). Columns >= `children` are the lowest-prob children —
+    replace them with the drop sentinel so they neither seed the beam (fast_topk over
+    the flattened lines) nor survive the global rerank (they're stored in tree_info[0]).
+    No-op unless 0 < children < topk."""
+    if not (0 < children < topk):
+        return expand_scores
+    col = torch.arange(topk, device=expand_scores.device)
+    drop = _LOG_DROP if log_domain else 0.0
+    return torch.where(
+        (col < children).view(1, 1, topk),
+        expand_scores,
+        expand_scores.new_full((), drop),
+    )
+
+
 def _select_top_k_tokens_first(
     topk_p: torch.Tensor,
     topk_index: torch.Tensor,
     hidden_states: Optional[torch.Tensor],
     topk: int,
+    log_domain: bool = False,
+    grace: int = 0,
 ):
     input_ids = topk_index.flatten()
     if hidden_states is not None:
         hidden_states = hidden_states.repeat_interleave(topk, dim=0)
 
+    # Level-0 path score. In log domain the whole tree accumulates as a sum of
+    # log-probs, so seed the root scores (and score_list entry) with log p too —
+    # every score_list entry must share one domain for the global rerank topk.
+    scores = torch.log(topk_p.clamp_min(_LOG_PROB_FLOOR)) if log_domain else topk_p
+
+    # Apply the same per-node children cap to the root that _cap_children applies
+    # to subsequent expand steps. Without this, the root always seeds topk=beam
+    # children into the global rerank pool regardless of SGLANG_SPEC_EXPAND_CHILDREN,
+    # producing extra shallow (d1) candidates that crowd out deep canonical paths.
+    # We zero scores (not just root_entry) so the -inf propagates through the
+    # cumulative sums in all subsequent _select_top_k_tokens_later calls, which
+    # also removes those branches from the frontier selection. input_ids is left
+    # untouched (the draft model still runs on all topk root children; the extra
+    # compute is a small cost for the diagnostic experiment).
+    root_entry = scores.unsqueeze(1)  # (b, 1, topk)
+    children = _SPEC_EXPAND_CHILDREN
+    if 0 < children < topk:
+        drop = _LOG_DROP if log_domain else 0.0
+        col = torch.arange(topk, device=scores.device)
+        mask = col < children  # (topk,)
+        root_entry = torch.where(mask, root_entry, root_entry.new_full((), drop))
+        scores = torch.where(mask, scores, scores.new_full((), drop))
+
     tree_info = (
-        topk_p.unsqueeze(1),  # (b, 1, topk)
+        root_entry,  # (b, 1, topk)
         topk_index,  # (b, topk)
         torch.arange(-1, topk, dtype=torch.long, device=input_ids.device).expand(
             topk_p.shape[0], -1
         ),  # (b, topk + 1) — expand avoids the allocation of repeat
     )
-    return input_ids, hidden_states, topk_p, tree_info
+    if grace > 0:
+        # Root candidates are all "healthy" — full grace budget, nothing has failed
+        # a mass cut yet (the root has no nucleus filtering).
+        grace_left = torch.full(
+            (topk_p.shape[0], topk), grace, dtype=torch.long, device=topk_p.device
+        )
+        tree_info = tree_info + (grace_left,)
+    return input_ids, hidden_states, scores, tree_info
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
@@ -230,11 +348,21 @@ def _select_top_k_tokens_later(
     hidden_states: torch.Tensor,
     scores: torch.Tensor,
     topk: int,
+    log_domain: bool = False,
+    children: int = 0,
 ):
     topk_sq = topk * topk
 
-    expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)
-    # (b, topk, 1) * (b, topk, topk) -> (b, topk, topk)
+    if log_domain:
+        # cumulative log-prob: parent log-score + child conditional log-prob.
+        expand_scores = scores.unsqueeze(2) + torch.log(
+            topk_p.view(-1, topk, topk).clamp_min(_LOG_PROB_FLOOR)
+        )
+    else:
+        expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)
+    # (b, topk, 1) [op] (b, topk, topk) -> (b, topk, topk)
+
+    expand_scores = _cap_children(expand_scores, topk, children, log_domain)
 
     topk_cs_p, topk_cs_index = fast_topk(
         expand_scores.flatten(start_dim=1), topk, dim=-1
@@ -259,6 +387,97 @@ def _select_top_k_tokens_later(
     return input_ids, hidden_states, topk_cs_p, tree_info
 
 
+@torch.compile(dynamic=True, disable=_is_npu)
+def _select_top_k_tokens_later_nucleus(
+    i: int,
+    topk_p: torch.Tensor,
+    topk_index: torch.Tensor,
+    hidden_states: torch.Tensor,
+    scores: torch.Tensor,
+    topk: int,
+    p: float,
+    log_domain: bool = False,
+    children: int = 0,
+    grace_left: Optional[torch.Tensor] = None,
+    grace: int = 0,
+):
+    """Nucleus controlled-expand (pt_tree rerank-p): identical to _select_top_k_tokens_later
+    but the next-step expand beam is narrowed to the minimal set of lines covering fraction
+    `p` of the live path-prob mass (capped at topk). Lines beyond the cut get their carried
+    score zeroed, so their children score 0 and are dropped by the global rerank
+    (organize_draft_results) — the EXPAND beam breathes (~1 on a confident spine, up to topk
+    at a gate) while the verify budget B is still allocated globally. This step's own nodes
+    keep their real scores in score_list (tree_info[0]), so un-expanded siblings remain
+    eligible verify leaves — exactly pt_tree's controlled-expand.
+
+    grace (pt_tree port): the mass cut is memoryless — a line that fails it is masked
+    immediately, and its children score ~-inf starting the VERY NEXT level (permanent
+    death after one bad level). grace_left tracks a per-line countdown: a line that
+    fails the mass cut but still has grace_left>0 (inherited from its parent) is kept
+    anyway, and its budget decrements by one; a line that PASSES the mass cut has its
+    budget refilled to `grace` (healthy again). 0 = disabled, native behavior."""
+    topk_sq = topk * topk
+
+    if log_domain:
+        expand_scores = scores.unsqueeze(2) + torch.log(
+            topk_p.view(-1, topk, topk).clamp_min(_LOG_PROB_FLOOR)
+        )
+    else:
+        expand_scores = scores.unsqueeze(2) * topk_p.view(-1, topk, topk)
+    expand_scores = _cap_children(expand_scores, topk, children, log_domain)
+    topk_cs_p, topk_cs_index = fast_topk(
+        expand_scores.flatten(start_dim=1), topk, dim=-1
+    )  # (b, topk), descending (fast_topk -> torch.topk sorted)
+
+    # nucleus mass cut over the (descending) kept lines: keep the minimal prefix whose
+    # cumulative mass reaches p of the total; always keeps the top-1 line. The cut is a
+    # PROBABILITY-mass cut, so in log domain exponentiate first (subtract the row max for
+    # stability — the normalization constant cancels in the csum/total ratio).
+    mass = (
+        torch.exp(topk_cs_p - topk_cs_p.max(dim=-1, keepdim=True).values)
+        if log_domain
+        else topk_cs_p
+    )
+    total = mass.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+    csum = torch.cumsum(mass, dim=-1)
+    keep_by_mass = (csum - mass) < (p * total)
+
+    new_grace_left = None
+    if grace > 0 and grace_left is not None:
+        parent_row = topk_cs_index // topk  # (b, topk) — which parent line each survivor came from
+        parent_grace = grace_left.gather(1, parent_row)
+        keep = keep_by_mass | (parent_grace > 0)
+        new_grace_left = torch.where(
+            keep_by_mass, torch.full_like(parent_grace, grace), (parent_grace - 1).clamp(min=0)
+        )
+    else:
+        keep = keep_by_mass
+
+    # "drop" = prob 0 (product domain) / -inf sentinel (log domain) so children rank last.
+    drop = torch.full_like(topk_cs_p, _LOG_DROP if log_domain else 0.0)
+    topk_cs_p = torch.where(keep, topk_cs_p, drop)
+
+    topk_index = topk_index.view(-1, topk_sq)
+    input_ids = torch.gather(topk_index, 1, topk_cs_index).flatten()
+
+    if hidden_states is not None and hidden_states.shape[0] > 0:
+        flat_cs = topk_cs_index.flatten()
+        batch_offsets = torch.arange(
+            0, hidden_states.shape[0], step=topk, device=flat_cs.device
+        )
+        selected_input_index = flat_cs // topk + batch_offsets.repeat_interleave(topk)
+        hidden_states = hidden_states[selected_input_index]
+
+    tree_info = (
+        expand_scores,  # (b, topk, topk) — real candidate scores for the global rerank
+        topk_index,  # (b, topk * topk)
+        topk_cs_index + (topk_sq * (i - 1) + topk),  # (b, topk)
+    )
+    if new_grace_left is not None:
+        tree_info = tree_info + (new_grace_left,)
+    return input_ids, hidden_states, topk_cs_p, tree_info
+
+
 def select_top_k_tokens(
     i: int,
     topk_p: torch.Tensor,
@@ -266,11 +485,20 @@ def select_top_k_tokens(
     hidden_states: torch.Tensor,
     scores: torch.Tensor,
     topk: int,
+    grace_left: Optional[torch.Tensor] = None,
 ):
     if i == 0:
-        return _select_top_k_tokens_first(topk_p, topk_index, hidden_states, topk)
+        return _select_top_k_tokens_first(
+            topk_p, topk_index, hidden_states, topk, _SPEC_LOG_DOMAIN, _SPEC_NUCLEUS_GRACE,
+        )
+    if _SPEC_EXPAND_P > 0.0 and i >= _SPEC_NUCLEUS_DELAY:
+        return _select_top_k_tokens_later_nucleus(
+            i, topk_p, topk_index, hidden_states, scores, topk, _SPEC_EXPAND_P,
+            _SPEC_LOG_DOMAIN, _SPEC_EXPAND_CHILDREN, grace_left, _SPEC_NUCLEUS_GRACE,
+        )
     return _select_top_k_tokens_later(
-        i, topk_p, topk_index, hidden_states, scores, topk
+        i, topk_p, topk_index, hidden_states, scores, topk, _SPEC_LOG_DOMAIN,
+        _SPEC_EXPAND_CHILDREN,
     )
 
 
