@@ -205,7 +205,7 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
                 num_experts,
                 scales_size13,
                 2 * intermediate_size_per_partition,
-                dtype=torch.half,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -213,12 +213,14 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
         set_weight_attrs(w13_scales, extra_weight_attrs)
 
         w2_scales = torch.nn.Parameter(
-            torch.empty(num_experts, scales_size2, hidden_size, dtype=torch.half),
+            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_scales", w2_scales)
         set_weight_attrs(w2_scales, extra_weight_attrs)
-        set_weight_attrs(w2_scales, {"load_full_w2": self.quant_config.desc_act})
+        # desc_act=False → Marlin needs all n_groups replicated per TP rank (full
+        # checkpoint size); desc_act=True → scales are TP-sharded (need narrow).
+        set_weight_attrs(w2_scales, {"load_full_w2": not self.quant_config.desc_act})
 
         w13_qzeros = torch.nn.Parameter(
             torch.empty(
@@ -243,7 +245,7 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
         )
         layer.register_parameter("w2_qzeros", w2_qzeros)
         set_weight_attrs(w2_qzeros, extra_weight_attrs)
-        set_weight_attrs(w2_qzeros, {"load_full_w2": self.quant_config.desc_act})
+        set_weight_attrs(w2_qzeros, {"load_full_w2": not self.quant_config.desc_act})
 
         w13_g_idx = torch.nn.Parameter(
             torch.empty(
