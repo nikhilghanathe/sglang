@@ -939,13 +939,20 @@ class FusedMoE(torch.nn.Module):
                 FusedMoeWeightScaleSupported.GROUP.value,
                 FusedMoeWeightScaleSupported.BLOCK.value,
             ]:
-                self._load_model_weight_or_group_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=tp_rank,
-                )
+                # GPTQ Marlin MoE w/ desc_act=False: w2 scales/zeros are allocated at
+                # full n_groups size (replicated per TP rank) because the Marlin kernel
+                # needs all K-groups when is_k_full=True. The checkpoint weight already
+                # has the right shape — copy directly without TP-sharding the loaded weight.
+                if shard_id == "w2" and getattr(param, "load_full_w2", False):
+                    expert_data.copy_(loaded_weight)
+                else:
+                    self._load_model_weight_or_group_weight_scale(
+                        shard_id=shard_id,
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        expert_data=expert_data,
+                        tp_rank=tp_rank,
+                    )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
                 if _is_hip and get_bool_env_var("SGLANG_INT4_WEIGHT"):
