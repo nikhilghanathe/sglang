@@ -112,10 +112,28 @@ class EagleDraftWorkerBase(ABC):
         self.draft_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
         self._capture_cuda_graphs()
 
+    def _validate_spec_tree_shape(self) -> None:
+        """num_draft_tokens must leave room for the longest path the tree can grow.
+
+        verify builds accept_index as [bs, spec_steps + 1] and compacts it into a
+        per-request block of num_draft_tokens slots, so num_draft_tokens <
+        num_steps + 1 is an out-of-bounds write. Upstream only checks this on the
+        topk==1 path; with topk > 1 it surfaced as a shape error inside the first
+        verify, after model load. Fail at startup instead.
+        """
+        if self.speculative_num_draft_tokens < self.speculative_num_steps + 1:
+            raise ValueError(
+                f"--speculative-num-draft-tokens ({self.speculative_num_draft_tokens}) "
+                f"must be >= --speculative-num-steps + 1 "
+                f"({self.speculative_num_steps} + 1): the verify budget has to hold "
+                "the deepest path the draft can propose, plus the bonus token."
+            )
+
     def _rebuild_topk1_chain_buffers(self) -> None:
         # For topk=1 the draft tree degenerates to a chain, so parent_list and
         # top_scores_index are runtime-invariant. Must be rebuilt after any
         # change to speculative_num_steps / speculative_num_draft_tokens.
+        self._validate_spec_tree_shape()
         if self.topk != 1:
             return
         # _override_worker_state can set both directly, bypassing the hook that

@@ -481,6 +481,13 @@ class Envs:
     SGLANG_SPEC_DEPTH_ALPHA = EnvFloat(0.0)
     # Verify only the single best branch (chain) of a wide tree. Ablation only.
     SGLANG_SPEC_ENABLE_SINGLE_BRANCH_VERIFY = EnvBool(False)
+    # --speculative-agreement-head debugging (see AGREEMENT_HEAD_INTEGRATION.md).
+    # Check the align-identity shortcut (full compare + host sync; run once).
+    SGLANG_DEBUG_AGREEMENT_VERIFY_ALIGN = EnvBool(False)
+    # Log once what fraction of tree children the head ranked (root vs deeper).
+    SGLANG_SPEC_AGREEMENT_DEBUG = EnvBool(False)
+    # torch.save the features the head consumed on the first draft_forward.
+    SGLANG_SPEC_AGREEMENT_DUMP = EnvStr(None)
     SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE = EnvBool(False)
     # Opt-in: emit one CUDA-graph capture trace per captured batch size (per-bs).
     # SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE (single combined trace) takes

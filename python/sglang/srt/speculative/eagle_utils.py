@@ -750,6 +750,20 @@ def get_draft_input_from_target_hidden_dim(model_runner: ModelRunner) -> int:
     return target_hidden * num_aux
 
 
+def draft_carries_hidden_states(spec_algorithm) -> bool:
+    """Whether the draft loop has to carry the draft model's hidden states.
+
+    EAGLE-family drafts consume them as input, so they always do. A STANDALONE
+    draft is a plain LM that takes token ids and normally discards its hidden
+    states end-to-end -- except that the agreement head's largest feature IS the
+    gate's hidden state, so --speculative-agreement-head turns the capture back
+    on. Kept in step with spec_utils.spec_need_hidden_states.
+    """
+    if not spec_algorithm.is_standalone():
+        return True
+    return get_spec().speculative_agreement_head is not None
+
+
 def get_draft_recurrent_hidden_state_spec_from_config(
     model_config, spec_algorithm
 ) -> tuple[Optional[int], Optional[torch.dtype]]:
@@ -759,7 +773,7 @@ def get_draft_recurrent_hidden_state_spec_from_config(
     builds the draft on the last stage alone, but the PD metadata wire schema it
     feeds has to come out identical on every rank.
     """
-    if spec_algorithm.is_standalone():
+    if not draft_carries_hidden_states(spec_algorithm):
         return None, None
     return model_config.spec_hidden_size, model_config.dtype
 

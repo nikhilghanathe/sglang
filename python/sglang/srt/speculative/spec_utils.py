@@ -391,8 +391,14 @@ def spec_need_hidden_states() -> bool:
     # multi_layer_eagle, DFLASH, and DSPARK don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
     spec = get_spec()
-    if spec.speculative_algorithm in ("STANDALONE", "DFLASH", "DSPARK"):
+    if spec.speculative_algorithm in ("DFLASH", "DSPARK"):
         return False
+    if spec.speculative_algorithm == "STANDALONE":
+        # ...except with --speculative-agreement-head, whose root gate reads the
+        # draft's hidden state out of spec_info. Without the relay the merged
+        # batch keeps whatever hidden_states the first request contributed.
+        # Kept in step with eagle_utils.draft_carries_hidden_states.
+        return spec.speculative_agreement_head is not None
     return not spec.enable_multi_layer_eagle
 
 

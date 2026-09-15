@@ -92,6 +92,7 @@ from sglang.srt.speculative.eagle_info import (
 from sglang.srt.speculative.eagle_utils import (
     _eagle_prefill_tail_tokens,
     default_tree_mask_mode,
+    draft_carries_hidden_states,
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
@@ -103,6 +104,11 @@ from sglang.srt.speculative.eagle_worker_common import (
     run_eagle_verify,
 )
 from sglang.srt.speculative.pp_draft_embedding import resolve_draft_embed_and_head
+from sglang.srt.speculative.agreement_head import (
+    LOG_MIN_AGREEMENT,
+    AgreementTreeScorer,
+    load_agreement_head,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
@@ -186,6 +192,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         self._rebuild_topk1_chain_buffers()
 
+        # Populated by init_agreement_head() once the draft model exists.
+        self.agreement_head = None
+        self._agreement_gather_logits = False
+        self._agreement_coverage = None
+        self._agreement_dump_path = None
+        self._agreement_dump = None
+
         # Use the same attention topology during draft construction and execution.
         self.draft_owns_attention = (
             get_parallel().enable_dp_attention
@@ -240,6 +253,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+        self.init_agreement_head()
 
         if get_spec().speculative_use_rejection_sampling:
             target_vocab_size = self.target_worker.model_config.vocab_size
@@ -377,6 +391,220 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             revision=target_runner.model_config.revision,
             load_config=target_runner.load_config,
         )
+
+    def init_agreement_head(self):
+        """Load the frozen target-agreement head used to rerank the draft tree.
+
+        Opt-in via --speculative-agreement-head; when it is unset every field
+        stays None and draft_forward runs byte-identically to before.
+
+        Everything this validates is a way for the head to be silently
+        MISCALIBRATED rather than to crash, and a miscalibrated head is worse
+        than no head at all (measured: -0.36 MAL on GSM8K, -2.25 on MATH-500
+        when applied off-distribution). So each condition errors at startup
+        instead of degrading a run whose numbers will still look plausible.
+        """
+        self.agreement_head = None
+        self._agreement_gather_logits = False
+        # Emptied out once the one-shot coverage diagnostic has been reported.
+        self._agreement_coverage = (
+            [] if envs.SGLANG_SPEC_AGREEMENT_DEBUG.get() else None
+        )
+        self._agreement_dump_path = envs.SGLANG_SPEC_AGREEMENT_DUMP.get()
+        self._agreement_dump = [] if self._agreement_dump_path else None
+
+        path = get_spec().speculative_agreement_head
+        if path is None:
+            return
+
+        if self.topk == 1:
+            raise ValueError(
+                "--speculative-agreement-head requires --speculative-eagle-topk > 1. "
+                "At topk=1 the draft is a chain, draft_forward takes the fast path "
+                "that skips organize_draft_results entirely, and there is no "
+                "candidate pool to rerank -- the head would be loaded and ignored."
+            )
+        if envs.SGLANG_SPEC_EXPAND_P.get() > 0.0:
+            raise ValueError(
+                "--speculative-agreement-head does not support the nucleus expand "
+                "path (SGLANG_SPEC_EXPAND_P > 0). _select_top_k_tokens_later_nucleus "
+                "zeroes the carried draft score for lines outside the mass cut, and "
+                "combining that with a second cumulative score is not worked out. "
+                "Unset SGLANG_SPEC_EXPAND_P."
+            )
+        if not envs.SGLANG_SPEC_ENABLE_LOG_DOMAIN.get():
+            raise ValueError(
+                "--speculative-agreement-head requires SGLANG_SPEC_ENABLE_LOG_DOMAIN=1. "
+                "Per-edge agreement probabilities are much smaller than draft ones "
+                "(mean log -0.448 vs -0.190), so product-domain accumulation "
+                "underflows fp32 well before the draft scores do."
+            )
+        if envs.SGLANG_SPEC_DEPTH_ALPHA.get() != 0.0:
+            raise ValueError(
+                "--speculative-agreement-head and SGLANG_SPEC_DEPTH_ALPHA are two "
+                "different fixes for the same problem (deep paths undervalued by a "
+                "cumulative product) and compose badly: dividing a negative "
+                "cumulative log-agreement by depth^alpha lets a child outrank its "
+                "own parent, breaking the ancestor closure the head otherwise gives "
+                "for free. Pick one."
+            )
+        if self.hot_token_id is not None:
+            raise ValueError(
+                "--speculative-agreement-head does not support a reduced draft vocab "
+                "(--speculative-token-map / EAGLE3 hot tokens). The head indexes the "
+                "draft's own embedding by token id, so a remapped id space silently "
+                "looks up the wrong token vector."
+            )
+
+        logits_processor = getattr(self.draft_runner.model, "logits_processor", None)
+        if logits_processor is not None:
+            if getattr(logits_processor, "use_attn_tp_group", False):
+                raise ValueError(
+                    "--speculative-agreement-head does not support --enable-dp-lm-head. "
+                    "The root gate's logits are recomputed from its hidden state and "
+                    "that path does not reproduce the attention-TP logits gather."
+                )
+            if getattr(logits_processor, "final_logit_softcapping", None):
+                raise ValueError(
+                    "--speculative-agreement-head does not support final logit "
+                    "softcapping; the recomputed root logits would skip it and the "
+                    "root gate's features would not match the deeper gates'."
+                )
+            self._agreement_gather_logits = bool(
+                getattr(logits_processor, "do_tensor_parallel_all_gather", False)
+            )
+
+        embedding_path = get_spec().speculative_agreement_embedding
+        if embedding_path is not None:
+            state = torch.load(embedding_path, map_location="cpu", weights_only=True)
+            weight = state["weight"] if isinstance(state, dict) else state
+        else:
+            weight = self._draft_input_embedding()
+
+        head = load_agreement_head(path, weight, self.device)
+        if head.top_k < self.topk:
+            raise ValueError(
+                f"--speculative-eagle-topk={self.topk} exceeds the agreement head's "
+                f"candidate set (top_k={head.top_k} in {path}). The head can only "
+                "score tokens inside its own top-k, so the extra children would all "
+                "be floored to the same worst value and their ordering would be "
+                "arbitrary."
+            )
+        self.agreement_head = head
+        log_info_on_rank0(
+            logger,
+            f"Agreement-head tree rerank ACTIVE: {path} "
+            f"(top_k={head.top_k}, eagle_topk={self.topk})",
+        )
+
+    def _draft_input_embedding(self) -> torch.Tensor:
+        """The draft model's input embedding, which the head indexes by token id.
+
+        Reused rather than carried separately because it is frozen in training,
+        so the values are identical by construction. Under TP the local shard is
+        only part of the vocab and gathering it here would have to reproduce
+        VocabParallelEmbedding's padding scheme, so point
+        --speculative-agreement-embedding at the saved full matrix instead.
+        """
+        model = self.draft_runner.model
+        embedding = getattr(getattr(model, "model", None), "embed_tokens", None)
+        if embedding is None or not hasattr(embedding, "weight"):
+            raise ValueError(
+                "could not find the draft model's input embedding "
+                f"({type(model).__name__}.model.embed_tokens); pass "
+                "--speculative-agreement-embedding with the saved weight instead."
+            )
+        vocab_size = self.draft_runner.model_config.vocab_size
+        if embedding.weight.shape[0] < vocab_size:
+            raise ValueError(
+                f"the draft model's input embedding is vocab-sharded "
+                f"({embedding.weight.shape[0]} rows < vocab {vocab_size}), which "
+                "happens under TP > 1. Pass --speculative-agreement-embedding with "
+                "the saved full embedding (the head's is frozen, so any copy of the "
+                "draft's matrix works)."
+            )
+        return embedding.weight
+
+    def _record_agreement_coverage(self, level: int, log_agree: torch.Tensor) -> None:
+        """One-shot check that the head is scoring the tree EAGLE actually built.
+
+        A child the head did not rank is floored to log(MIN_AGREEMENT), so the
+        fraction of floored edges is the fraction of the tree the head has no
+        opinion about. The root level is the one worth watching: its logits are
+        recomputed from the hidden state rather than kept from draft_extend, so
+        a wrong hidden state or lm_head drives root coverage to ~0 while the
+        deeper levels, which use the draft forward's own logits, stay high.
+
+        Python only runs during warm-up under CUDA graph replay, and the D2H
+        sync is illegal during capture -- run with --disable-cuda-graph to see
+        this, exactly as with SGLANG_DEBUG_SPEC_TREE_DEPTH.
+        """
+        if self._agreement_coverage is None:
+            return
+        if _is_cuda and torch.cuda.is_current_stream_capturing():
+            return
+        ranked = (log_agree != LOG_MIN_AGREEMENT).float().mean().item()
+        self._agreement_coverage.append((level, ranked))
+        if level < self.speculative_num_steps - 1:
+            return
+        summary = ", ".join(
+            f"L{lvl}={rate:.3f}" for lvl, rate in self._agreement_coverage
+        )
+        logger.info(
+            "[spec] agreement-head coverage (fraction of tree children the head "
+            "ranked): %s. L0 is the recomputed-root level; if it is near 0 while "
+            "the rest are near 1, the root logits are wrong.",
+            summary,
+        )
+        self._agreement_coverage = None
+
+    def _record_agreement_features(self, level: int, features: dict) -> None:
+        """One-shot dump of the features the head consumed, for parity testing.
+
+        The point is to diff these against the collection path that produced the
+        training set. They are the tensors the head actually consumed, not a
+        re-derivation, so a mismatch here is real train/serve skew and not an
+        artefact of the test. Eager only, for the same reason as the coverage
+        diagnostic.
+        """
+        if self._agreement_dump is None:
+            return
+        if _is_cuda and torch.cuda.is_current_stream_capturing():
+            return
+        self._agreement_dump.append(
+            {"level": level, **{k: v.detach().cpu() for k, v in features.items()}}
+        )
+        if level < self.speculative_num_steps - 1:
+            return
+        torch.save(self._agreement_dump, self._agreement_dump_path)
+        logger.info(
+            "[spec] agreement-head features for %d levels written to %s",
+            len(self._agreement_dump),
+            self._agreement_dump_path,
+        )
+        self._agreement_dump = None
+
+    def _root_draft_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Raw draft logits for the root gate, recomputed from its hidden state.
+
+        At i == 0 draft_forward is handed topk_p / topk_index / hidden_states out
+        of spec_info; the logits they came from were produced in draft_extend and
+        not kept. The head needs the full distribution (entropy over the whole
+        vocab, the top-1/top-2 gap), so recompute it. This is the same
+        lm_head-from-hidden recompute corsair's own runtime does
+        (`sglang_runtime._selected_tokens_from_hidden`), which is why the root
+        gate's features match training by construction rather than by testing.
+
+        Mirrors LogitsProcessor._compute_lm_head + the TP gather + the pad-vocab
+        truncation; it is b rows, not b * topk, so the extra matmul is cheap.
+        """
+        lm_head = self.draft_runner.model.lm_head
+        logits = torch.matmul(hidden.to(lm_head.weight.dtype), lm_head.weight.T)
+        if self._agreement_gather_logits:
+            from sglang.srt.distributed import tensor_model_parallel_all_gather
+
+            logits = tensor_model_parallel_all_gather(logits, dim=-1)
+        return logits[:, : self.draft_runner.model_config.vocab_size].float()
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -740,6 +968,52 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
 
+        # Agreement-head rerank (opt-in). The beam search below is untouched --
+        # only the value function the global top-B rerank sorts by changes, and
+        # only if a head was loaded.
+        scorer = None
+        if self.agreement_head is not None:
+            scorer = AgreementTreeScorer(self.agreement_head, self.topk)
+            # The head's two gate features are the gate's depth below the
+            # speculative root and the length of the context ending at it.
+            #
+            # `seq_lens` is exactly right for the second one, and the reason is
+            # not the obvious one. The root gate is the BONUS token, so the
+            # TARGET's sequence there is seq_lens + 1 -- but the DRAFT never sees
+            # that sequence. `_eagle_prefill_tail_tokens` rotates the draft's
+            # input to `prompt[1:] + [bonus]`, so the draft attends to seq_lens
+            # tokens and prompt[0] is dropped. seq_lens is the draft's own
+            # context length, which is what a gate feature about the draft should
+            # report. Measured both ways on a 77-token prompt: the choice moves
+            # the head's output by 1e-4 nats, so it is the draft's shifted view
+            # (below) that matters here, not this.
+            #
+            # seq_lens, not positions: positions is padded to the graph's token
+            # count, seq_lens is one entry per request like hidden_states.
+            root_context_lengths = forward_batch.seq_lens
+            step_context_lengths = root_context_lengths.repeat_interleave(self.topk)
+            root_features = {}
+            # Sub-phase timers, behind the per-layer gate rather than the top-level
+            # one. Same validity condition: these sit INSIDE the graph-captured
+            # draft loop, so record() no-ops under capture/replay and would
+            # otherwise emit a biased sample from whichever forwards fell back to
+            # eager. Read them only on a --disable-cuda-graph run. The
+            # production cost of the head is the top-level `draft` phase delta
+            # between a head-on and a head-off run, which needs no timer here.
+            with spec_phase_timer.record_layer("agreement_root_logits"):
+                root_logits = self._root_draft_logits(hidden_states)
+            with spec_phase_timer.record_layer("agreement_head"):
+                log_agree = scorer.edge_log_agreement(
+                    root_logits,
+                    hidden_states,
+                    torch.zeros_like(root_context_lengths),
+                    root_context_lengths,
+                    topk_index,
+                    root_features,
+                )
+            self._record_agreement_coverage(0, log_agree)
+            self._record_agreement_features(0, root_features)
+
         # Forward multiple steps
         scores = None
         grace_left = None  # nucleus grace-window state; unused unless SGLANG_SPEC_NUCLEUS_GRACE>0
@@ -760,6 +1034,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     score_list.append(tree_info[0])
                     token_list.append(tree_info[1])
                     parents_list.append(tree_info[2])
+
+                if scorer is not None and draft_tokens_topk1 is None:
+                    # log_agree was built from the same topk_p/topk_index this call
+                    # just consumed, so it expands over exactly the tree EAGLE built.
+                    if i == 0:
+                        scorer.step_root(log_agree, tree_info[0])
+                    else:
+                        scorer.step_later(i, log_agree, tree_info[2], tree_info[0])
 
                 if i == self.speculative_num_steps - 1:
                     break
@@ -838,6 +1120,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
+                if scorer is not None:
+                    # These gates sit one level below the ones just scored: depth
+                    # i + 1 below the speculative root, and one more token of
+                    # context than the draft token at forward_batch.positions.
+                    # Must run before the next select_top_k_tokens reorders
+                    # hidden_states onto the beam it picks.
+                    step_features = {}
+                    with spec_phase_timer.record_layer("agreement_head"):
+                        log_agree = scorer.edge_log_agreement(
+                            logits_output.next_token_logits,
+                            hidden_states,
+                            torch.full_like(step_context_lengths, i + 1),
+                            step_context_lengths + (i + 1),
+                            topk_index,
+                            step_features,
+                        )
+                    self._record_agreement_coverage(i + 1, log_agree)
+                    self._record_agreement_features(i + 1, step_features)
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
@@ -859,9 +1159,18 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             parent_list = self._topk1_parents_prealloc[:bs]
             return parent_list, top_scores_index, draft_tokens, draft_probs
 
-        parent_list, top_scores_index, draft_tokens = organize_draft_results(
-            score_list, token_list, parents_list, self.speculative_num_draft_tokens
-        )
+        # organize_draft_results builds its global top-B over torch.cat(...) of
+        # whatever list it is given, so passing the agreement pool switches the
+        # node value function with no change to that function. Ancestor closure
+        # still holds for free: cumulative log-agreement is a sum of non-positive
+        # terms, so no descendant can outrank its ancestor.
+        with spec_phase_timer.record_layer("agreement_organize"):
+            parent_list, top_scores_index, draft_tokens = organize_draft_results(
+                score_list if scorer is None else scorer.rerank_scores(),
+                token_list,
+                parents_list,
+                self.speculative_num_draft_tokens,
+            )
 
         return parent_list, top_scores_index, draft_tokens, draft_probs
 
@@ -954,11 +1263,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Run forward (LAST mode: only the final hidden state per request,
         # to feed the next draft step which expects [bs, hidden_dim]).
-        # STANDALONE skips hidden states end-to-end.
+        # STANDALONE skips hidden states end-to-end unless the agreement head
+        # is on, which needs the root gate's hidden state from right here.
         capture_hidden_mode = (
-            CaptureHiddenMode.NULL
-            if self.speculative_algorithm.is_standalone()
-            else CaptureHiddenMode.LAST
+            CaptureHiddenMode.LAST
+            if draft_carries_hidden_states(self.draft_runner)
+            else CaptureHiddenMode.NULL
         )
         forward_batch = ForwardBatch.init_new(
             batch,
@@ -1343,9 +1653,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             if batch.spec_info is None:
                 capture_mode = (
-                    CaptureHiddenMode.NULL
-                    if self.speculative_algorithm.is_standalone()
-                    else CaptureHiddenMode.LAST
+                    CaptureHiddenMode.LAST
+                    if draft_carries_hidden_states(self.speculative_algorithm)
+                    else CaptureHiddenMode.NULL
                 )
                 hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
                     self.draft_worker.draft_runner

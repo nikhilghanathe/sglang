@@ -45,7 +45,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+from sglang.srt.speculative.eagle_utils import (
+    draft_carries_hidden_states,
+    get_draft_recurrent_hidden_state_spec,
+)
 from sglang.srt.speculative.spec_utils import resolve_num_tokens_per_req
 from sglang.srt.utils import (
     require_attn_tp_gather,
@@ -410,9 +413,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob = None
 
         capture_mode = (
-            CaptureHiddenMode.NULL
-            if self.model_runner.spec_algorithm.is_standalone()
-            else CaptureHiddenMode.LAST
+            CaptureHiddenMode.LAST
+            if draft_carries_hidden_states(self.model_runner.spec_algorithm)
+            else CaptureHiddenMode.NULL
         )
         spec_info = EagleDraftInput(
             topk_p=topk_p,

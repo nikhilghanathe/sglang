@@ -19,6 +19,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative import spec_phase_timer
 from sglang.srt.speculative.eagle_utils import (
+    draft_carries_hidden_states,
     TreeMaskMode,
     build_tree_kernel_efficient,
     eagle_prepare_for_verify,
@@ -168,9 +169,9 @@ def prepare_for_draft_extend(
         batch.extend_lens = [num_window_tokens] * bs
     batch.extend_num_tokens = extend_num_tokens
     capture_mode = (
-        CaptureHiddenMode.NULL
-        if draft_model_runner.spec_algorithm.is_standalone()
-        else CaptureHiddenMode.FULL
+        CaptureHiddenMode.FULL
+        if draft_carries_hidden_states(draft_model_runner.spec_algorithm)
+        else CaptureHiddenMode.NULL
     )
     batch.forward_mode = (
         ForwardMode.IDLE
@@ -298,9 +299,9 @@ def prepare_for_draft(
     draft_input.num_tokens_per_req = topk
     draft_input.num_tokens_for_logprob_per_req = topk
     capture_mode = (
-        CaptureHiddenMode.NULL
-        if draft_model_runner.spec_algorithm.is_standalone()
-        else CaptureHiddenMode.LAST
+        CaptureHiddenMode.LAST
+        if draft_carries_hidden_states(draft_model_runner.spec_algorithm)
+        else CaptureHiddenMode.NULL
     )
     draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
     forward_batch = ForwardBatch.init_new(
