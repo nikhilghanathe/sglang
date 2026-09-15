@@ -29,6 +29,7 @@ from transformers import PretrainedConfig
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.speculative import spec_phase_timer as _spec_timer
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerFacts,
@@ -619,24 +620,35 @@ class GptOssDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
+        # Per-layer sub-phase timing (CUDA events): attention / MoE / communication.
+        # Off unless SGLANG_DEBUG_SPEC_PHASE_TIMING=1 (no-op context manager when off).
+        # Only valid on extend/verify, which is not CUDA-graph captured. Set
+        # SGLANG_DEBUG_SPEC_PHASE_FLUSH_EVERY >> num_layers; see spec_phase_timer.py.
+        with _spec_timer.record_layer("layer_comm"):
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        if hidden_states.shape[0] != 0:
+            with _spec_timer.record_layer("layer_attn"):
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
 
+        with _spec_timer.record_layer("layer_comm"):
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
+
+        # The fused all-reduce now lives inside ffn_exit, so "layer_moe" covers the
+        # MoE compute and "layer_comm" the exit/reduce.
         with self.layer_communicator.ffn_exit(forward_batch) as ffn_exit:
-            hidden_states = self.mlp(hidden_states, forward_batch)
-        hidden_states, residual = ffn_exit.finish(hidden_states, residual)
+            with _spec_timer.record_layer("layer_moe"):
+                hidden_states = self.mlp(hidden_states, forward_batch)
+        with _spec_timer.record_layer("layer_comm"):
+            hidden_states, residual = ffn_exit.finish(hidden_states, residual)
 
         return hidden_states, residual
 
