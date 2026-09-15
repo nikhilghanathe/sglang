@@ -34,7 +34,10 @@ from sglang.srt.model_executor.runner_backend_utils import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.speculative.eagle_info import EagleDraftInput
-from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
+from sglang.srt.speculative.eagle_utils import (
+    draft_carries_hidden_states,
+    get_draft_recurrent_hidden_state_spec,
+)
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -357,9 +360,9 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             global_num_tokens_for_logprob = None
 
         capture_mode = (
-            CaptureHiddenMode.NULL
-            if self.model_runner.spec_algorithm.is_standalone()
-            else CaptureHiddenMode.LAST
+            CaptureHiddenMode.LAST
+            if draft_carries_hidden_states(self.model_runner)
+            else CaptureHiddenMode.NULL
         )
         spec_info = EagleDraftInput(
             topk_p=topk_p,

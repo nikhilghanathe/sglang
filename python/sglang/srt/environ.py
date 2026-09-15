@@ -285,6 +285,12 @@ class Envs:
     # and dumps per-phase total ms + step counts to the json path below at process
     # exit. Worker runs in a subprocess, so the file is how timing reaches the bench.
     SGLANG_DEBUG_SPEC_PHASE_TIMING = EnvBool(False)
+    # Verify that the agreement head's align-identity shortcut is legitimate, i.e.
+    # that equal-width head_ids and selected_ids really are equal. Off by default:
+    # the check is a full tensor compare plus a host sync, so it would defeat the
+    # shortcut it validates. Turn it on once after any change to draft-side
+    # sampling (temperature, top-p, renorm) or to eagle_topk.
+    SGLANG_DEBUG_AGREEMENT_VERIFY_ALIGN = EnvBool(False)
     SGLANG_DEBUG_SPEC_PHASE_TIMING_OUT = EnvStr(None)
     # Speculative decoding — experimental tree EXPAND policy (ported from the offline
     # pt_tree harness). 0.0 = native fixed-top-k expand beam (EAGLE-2 fixed width).
@@ -333,6 +339,19 @@ class Envs:
     # for comparison against the offline pt_tree harness. Accumulated + dumped to the json path.
     SGLANG_DEBUG_SPEC_TREE_DEPTH = EnvBool(False)
     SGLANG_DEBUG_SPEC_TREE_DEPTH_OUT = EnvStr(None)
+    # Debug: for --speculative-agreement-head, log once per worker what fraction of the
+    # tree's children the head actually ranked, split by root vs deeper levels. The root
+    # gate's logits are RECOMPUTED from its hidden state (they are not kept in spec_info),
+    # so a wrong hidden state or lm_head shows up as a root match rate near zero while the
+    # deeper levels stay near one — a failure that otherwise only appears as a bad MAL.
+    # Costs one D2H sync on the first draft step, so leave it off in production.
+    SGLANG_SPEC_AGREEMENT_DEBUG = EnvBool(False)
+    # Debug: for --speculative-agreement-head, torch.save the features the head
+    # actually consumed on the first draft_forward to this path, one entry per tree
+    # level. Produced by the same build_agreement_features() the head consumes, so a
+    # diff against the collection path is a real parity test rather than a
+    # re-derivation. Eager only (--disable-cuda-graph); writes once, then disarms.
+    SGLANG_SPEC_AGREEMENT_DUMP = EnvStr(None)
     # Upcast draft logits to float32 before softmax during tree expansion. bf16 logits produce
     # a flatter distribution (more competing alternatives at shallow depths), which fills the
     # top-B verify budget with shallow nodes and crowds out deep canonical paths. float32 gives

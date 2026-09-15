@@ -1537,6 +1537,14 @@ class ServerArgs:
         Optional[str],
         "The path of the draft model's small vocab table.",
     ] = None
+    speculative_agreement_head: A[
+        Optional[str],
+        "Path to a frozen target-agreement head checkpoint. When set, EAGLE's candidate pool is reranked by cumulative log P(target accepts the path) instead of by cumulative draft log-prob; the beam search itself is unchanged. Requires --speculative-eagle-topk > 1 and SGLANG_SPEC_ENABLE_LOG_DOMAIN=1. The head is calibrated to the distribution it was trained on and is worse than no head off-distribution, so train it on the serving corpus.",
+    ] = None
+    speculative_agreement_embedding: A[
+        Optional[str],
+        "Path to the draft model's full input embedding matrix, for --speculative-agreement-head. Only needed when the draft runs with TP > 1, where the in-memory embedding is vocab-sharded; otherwise the draft model's own embedding is reused.",
+    ] = None
     speculative_attention_mode: A[
         str,
         Arg(

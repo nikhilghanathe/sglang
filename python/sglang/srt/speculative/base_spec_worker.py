@@ -103,6 +103,7 @@ class EagleDraftWorkerBase(ABC):
             ForwardBatch,
             ForwardMode,
         )
+        from sglang.srt.speculative.eagle_utils import draft_carries_hidden_states
         from sglang.srt.utils.async_probe import maybe_detect_oob
         from sglang.srt.utils.common import is_npu
 
@@ -135,9 +136,9 @@ class EagleDraftWorkerBase(ABC):
             batch.extend_lens = [num_draft_tokens] * bs
         batch.extend_num_tokens = extend_num_tokens
         capture_mode = (
-            CaptureHiddenMode.NULL
-            if draft_model_runner.spec_algorithm.is_standalone()
-            else CaptureHiddenMode.FULL
+            CaptureHiddenMode.FULL
+            if draft_carries_hidden_states(draft_model_runner)
+            else CaptureHiddenMode.NULL
         )
         batch.forward_mode = (
             ForwardMode.IDLE
@@ -187,6 +188,7 @@ class EagleDraftWorkerBase(ABC):
             CaptureHiddenMode,
             ForwardBatch,
         )
+        from sglang.srt.speculative.eagle_utils import draft_carries_hidden_states
         from sglang.srt.speculative.triton_ops.cache_locs import (
             assign_draft_cache_locs_contiguous,
         )
@@ -258,9 +260,9 @@ class EagleDraftWorkerBase(ABC):
         draft_input.num_tokens_per_req = topk
         draft_input.num_tokens_for_logprob_per_req = topk
         capture_mode = (
-            CaptureHiddenMode.NULL
-            if draft_model_runner.spec_algorithm.is_standalone()
-            else CaptureHiddenMode.LAST
+            CaptureHiddenMode.LAST
+            if draft_carries_hidden_states(draft_model_runner)
+            else CaptureHiddenMode.NULL
         )
         draft_input.positions = batch.seq_lens.repeat_interleave(topk, dim=0)
         batch.capture_hidden_mode = capture_mode
