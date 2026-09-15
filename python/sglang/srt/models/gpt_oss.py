@@ -34,6 +34,7 @@ from sglang.srt.distributed import (
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
+from sglang.srt.speculative import spec_phase_timer as _spec_timer
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -589,20 +590,34 @@ class GptOssDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        hidden_states, residual = self.layer_communicator.prepare_attn(
-            hidden_states, residual, forward_batch
-        )
-
-        if hidden_states.shape[0] != 0:
-            hidden_states = self.self_attn(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
+        # Per-layer sub-phase timing (CUDA events), for decomposing a verify forward into
+        # attention / MoE / communication. Off unless SGLANG_DEBUG_SPEC_PHASE_TIMING=1, and
+        # a no-op context manager when off, so the hot path is unchanged in normal runs.
+        #
+        # Safe to use CUDA events here because the extend/verify forward is NOT
+        # CUDA-graph captured (prefill cuda_graph backend defaults to 'disabled'); the
+        # decode path is captured, and events inside a replayed graph would not measure
+        # what you expect.
+        #
+        # Set SGLANG_DEBUG_SPEC_PHASE_FLUSH_EVERY high (>> num_layers) when using these --
+        # see the note in spec_phase_timer.py.
+        with _spec_timer.record_layer("layer_comm"):
+            hidden_states, residual = self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
             )
 
-        hidden_states, residual = self.layer_communicator.prepare_mlp(
-            hidden_states, residual, forward_batch
-        )
+        if hidden_states.shape[0] != 0:
+            with _spec_timer.record_layer("layer_attn"):
+                hidden_states = self.self_attn(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+
+        with _spec_timer.record_layer("layer_comm"):
+            hidden_states, residual = self.layer_communicator.prepare_mlp(
+                hidden_states, residual, forward_batch
+            )
 
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
@@ -610,15 +625,19 @@ class GptOssDecoderLayer(nn.Module):
             )
         )
 
-        hidden_states = self.mlp(hidden_states, forward_batch, should_allreduce_fusion)
+        with _spec_timer.record_layer("layer_moe"):
+            hidden_states = self.mlp(
+                hidden_states, forward_batch, should_allreduce_fusion
+            )
 
         if should_allreduce_fusion:
             hidden_states._sglang_needs_allreduce_fusion = True
 
         if not should_allreduce_fusion:
-            hidden_states, residual = self.layer_communicator.postprocess_layer(
-                hidden_states, residual, forward_batch
-            )
+            with _spec_timer.record_layer("layer_comm"):
+                hidden_states, residual = self.layer_communicator.postprocess_layer(
+                    hidden_states, residual, forward_batch
+                )
 
         return hidden_states, residual
 
