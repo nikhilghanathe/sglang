@@ -75,6 +75,10 @@ class StandaloneDraftWorker(EagleDraftWorker):
         self._topk1_score_indices_prealloc = None
         self._rebuild_topk1_chain_buffers()
 
+        # Populated by init_agreement_head() once the draft model exists.
+        self.agreement_head = None
+        self._agreement_gather_logits = False
+
         # Set constant
         from sglang.srt.speculative.eagle_info import EagleDraftInput
 
@@ -130,6 +134,7 @@ class StandaloneDraftWorker(EagleDraftWorker):
         )
         self.init_token_map()
         self.init_lm_head()
+        self.init_agreement_head()
 
     def init_attention_backends(self):
         with self.draft_tp_context(

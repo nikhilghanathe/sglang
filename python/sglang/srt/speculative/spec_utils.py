@@ -248,8 +248,16 @@ def spec_need_hidden_states(server_args: Optional[ServerArgs] = None) -> bool:
     # STANDALONE drafts don't consume `spec_info.hidden_states` (vanilla LLM).
     # multi_layer_eagle and DFLASH don't relay hidden_states through FutureMap.
     # TODO(lsyin): also skip when step == 1.
-    if server_args.speculative_algorithm in ("STANDALONE", "DFLASH"):
+    if server_args.speculative_algorithm == "DFLASH":
         return False
+    if server_args.speculative_algorithm == "STANDALONE":
+        # ...except with --speculative-agreement-head, whose root gate reads the
+        # draft's hidden state out of spec_info. Without the relay the merged
+        # batch keeps whatever hidden_states the first request contributed, so a
+        # batch of two decodes silently scores both roots from one request's
+        # hidden state. Kept in step with eagle_utils.draft_carries_hidden_states,
+        # which decides the matching CaptureHiddenMode.
+        return server_args.speculative_agreement_head is not None
     return not server_args.enable_multi_layer_eagle
 
 
