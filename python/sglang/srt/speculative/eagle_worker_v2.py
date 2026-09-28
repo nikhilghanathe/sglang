@@ -1267,7 +1267,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # is on, which needs the root gate's hidden state from right here.
         capture_hidden_mode = (
             CaptureHiddenMode.LAST
-            if draft_carries_hidden_states(self.draft_runner)
+            if draft_carries_hidden_states(self.draft_runner.spec_algorithm)
             else CaptureHiddenMode.NULL
         )
         forward_batch = ForwardBatch.init_new(
