@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from http import HTTPStatus
 from typing import (
@@ -80,6 +81,7 @@ if TYPE_CHECKING:
     from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 
 logger = logging.getLogger(__name__)
+_LAST_PREFILL_HIDDEN_ONLY = os.environ.get("SGLANG_LAST_PREFILL_HIDDEN_ONLY") == "1"
 
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
@@ -634,7 +636,12 @@ class SchedulerBatchResultProcessor:
                 return hidden_state_offset
 
             req_hidden_states = logits_output.hidden_states[start:hidden_state_offset]
-            if req.return_hidden_states is True:
+            if req.return_hidden_states is True and _LAST_PREFILL_HIDDEN_ONLY:
+                # spec-dec-opt compat: offline tree-search clients need only the
+                # final prefill vector, in the [[...]] shape they already parse.
+                # Upstream's return_hidden_states="last" returns a flat vector.
+                req.hidden_states.append(req_hidden_states[-1:].cpu().tolist())
+            elif req.return_hidden_states is True:
                 req.hidden_states.append(req_hidden_states.cpu().clone().tolist())
             elif req.return_hidden_states == "last":
                 req.hidden_states.append(req_hidden_states[-1].cpu().tolist())

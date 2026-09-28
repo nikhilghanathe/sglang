@@ -87,7 +87,23 @@ class AgreementScorer(nn.Module):
     # So removing the full-vocab softmax does not weaken the none class, it
     # strengthens it.
     TOPK_GATE_FEATURES = ("spread", "eff_count")
-    ALL_GATE_FEATURES = LEGACY_GATE_FEATURES + TOPK_GATE_FEATURES
+    # TARGET-DERIVED features, added 2026-09-16. These are the target's OWN
+    # uncertainty at the PREVIOUS position -- i.e. the distribution that predicted
+    # the token we have just accepted. Every other feature here is draft-side.
+    #
+    # WHY THEY ARE LEGITIMATE AT INFERENCE: the verify pass computes the target's
+    # full next-token distribution at the last accepted position and currently
+    # discards everything except its argmax (the bonus token). Its SHAPE is free.
+    # So this is a real inference-time feature, not a label -- no train/serve
+    # asymmetry, unlike the soft labels in train_agreement.py --soft-labels.
+    #
+    # !! SERVING PLUMBING IS NOT IMPLEMENTED !! A head trained with these will
+    # load and run, but `build_agreement_features` has no source for them, so
+    # serving would have to synthesise a sentinel. Threading them from verify into
+    # the next cycle's draft_forward (and through CUDA-graph capture) is real
+    # SGLang surgery. Until it exists, evaluate these arms OFFLINE only.
+    TARGET_GATE_FEATURES = ("target_entropy", "target_gap")
+    ALL_GATE_FEATURES = LEGACY_GATE_FEATURES + TOPK_GATE_FEATURES + TARGET_GATE_FEATURES
 
     def __init__(
         self,
@@ -171,6 +187,12 @@ class AgreementScorer(nn.Module):
             # TRUNCATED entropy (Spearman +0.9612 with the full-vocab entropy)
             # obtained from the k exps the normaliser already computes.
             "eff_count": lambda: torch.logsumexp(_lp(), dim=-1) - _lp()[:, 0],
+            # target-derived; see TARGET_GATE_FEATURES. Supplied by the training
+            # loader from collect_target_logprobs.py, SHIFTED BY ONE POSITION so a
+            # gate only ever sees the target distribution that was available before
+            # it. Position 0 gets a zero sentinel.
+            "target_entropy": lambda: batch["target_entropy"],
+            "target_gap": lambda: batch["target_gap"],
         }
         return torch.stack([columns[name]() for name in self._gate_features], dim=-1)
 
