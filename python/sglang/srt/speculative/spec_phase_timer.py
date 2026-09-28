@@ -29,6 +29,11 @@ from sglang.srt.environ import envs
 _PENDING: Dict[str, List[Tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
 # phase -> [total_ms, step_ct]
 _TOTALS: Dict[str, List[float]] = {}
+# phase -> bucket (e.g. batch size) -> [total_ms, step_ct]. Only filled for record()
+# calls that pass bucket=..., so the flat _TOTALS schema above is unchanged.
+_BUCKETED: Dict[str, Dict[int, List[float]]] = {}
+# phase -> bucket per pending event pair, aligned with _PENDING[phase]
+_PENDING_BUCKETS: Dict[str, List] = {}
 # Fold (sync once) + write the file after this many records per phase.
 #
 # 32 is right for the four top-level phases, which record ONE pair per phase per
@@ -127,8 +132,13 @@ def record_layer(phase: str):
 
 
 @contextmanager
-def record(phase: str):
-    """Time a phase with a CUDA-event pair. No-op (and no allocation) when disabled."""
+def record(phase: str, bucket=None):
+    """Time a phase with a CUDA-event pair. No-op (and no allocation) when disabled.
+
+    ``bucket`` (optional, hashable int such as the batch size) additionally files the
+    sample under ``by_bucket[phase][bucket]`` in the json sink, so per-pass cost can be
+    compared at matched batch size across runs.
+    """
     if not enabled() or _capturing():
         yield
         return
@@ -141,6 +151,7 @@ def record(phase: str):
         end.record()
         pending = _PENDING.setdefault(phase, [])
         pending.append((start, end))
+        _PENDING_BUCKETS.setdefault(phase, []).append(bucket)
         if len(pending) >= _FLUSH_EVERY:
             _fold(phase)
             _write()  # write incrementally: worker is killed by signal, atexit may not fire
@@ -152,18 +163,29 @@ def _fold(phase: str) -> None:
         return
     torch.cuda.synchronize()  # required before Event.elapsed_time
     total, ct = _TOTALS.get(phase, [0.0, 0])
-    for s, e in pending:
+    buckets = _PENDING_BUCKETS.get(phase, [])
+    if len(buckets) != len(pending):
+        buckets = [None] * len(pending)
+    for (s, e), b in zip(pending, buckets):
         # A pair can be half-recorded if the region unwound between start and end (an
         # aborted CUDA-graph capture does exactly this). Dropping it is right: the
         # alternative is ValueError("Both events must be recorded ...") which would take
         # down the atexit dump and lose every other phase's totals too.
         try:
-            total += s.elapsed_time(e)
+            ms = s.elapsed_time(e)
         except Exception:
             continue
+        total += ms
         ct += 1
+        if b is not None:
+            slot = _BUCKETED.setdefault(phase, {}).setdefault(b, [0.0, 0])
+            slot[0] += ms
+            slot[1] += 1
     _TOTALS[phase] = [total, ct]
     pending.clear()
+    buckets_list = _PENDING_BUCKETS.get(phase)
+    if buckets_list is not None:
+        buckets_list.clear()
 
 
 def _write() -> None:
@@ -174,6 +196,11 @@ def _write() -> None:
     if not out:
         return
     data = {ph: {"total_ms": t, "ct": c} for ph, (t, c) in _TOTALS.items()}
+    if _BUCKETED:
+        data["by_bucket"] = {
+            ph: {str(b): {"total_ms": t, "ct": c} for b, (t, c) in sorted(d.items())}
+            for ph, d in _BUCKETED.items()
+        }
     try:
         with open(out, "w") as f:
             json.dump(data, f)

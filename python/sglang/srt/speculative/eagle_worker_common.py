@@ -569,7 +569,7 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    with spec_phase_timer.record("target_forward"):
+    with spec_phase_timer.record("target_forward", bucket=len(batch.reqs)):
         forward_batch_output = target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
