@@ -20,7 +20,8 @@ from __future__ import annotations
 import sys
 import torch
 
-sys.path.insert(0, "/home/ubuntu/pratap/GithubProjects/sglang/python")
+import os as _os
+sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "../../..")))  # this checkout
 from sglang.srt.speculative.agreement_head import (
     AgreementTreeScorer,
     LOG_MIN_AGREEMENT,

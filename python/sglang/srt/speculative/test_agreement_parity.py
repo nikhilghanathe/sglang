@@ -14,7 +14,8 @@ import sys
 import torch
 
 sys.path.insert(0, "/home/ubuntu/pratap/GithubProjects/corsair-spec-selector/src")
-sys.path.insert(0, "/home/ubuntu/pratap/GithubProjects/sglang/python")
+import os as _os
+sys.path.insert(0, _os.path.abspath(_os.path.join(_os.path.dirname(__file__), "../../..")))  # this checkout
 
 from corsair_spec_selector.agreement_model import AgreementScorer as CorsairScorer
 from sglang.srt.speculative.agreement_head import (
