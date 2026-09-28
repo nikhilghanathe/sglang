@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -469,17 +470,19 @@ class SchedulerBatchResultProcessor:
         logits_output: LogitsProcessorOutput,
         hidden_state_offset: int,
     ) -> int:
-        req.hidden_states.append(
-            logits_output.hidden_states[
-                hidden_state_offset : (
-                    hidden_state_offset := hidden_state_offset
-                    + len(req.origin_input_ids)
-                )
-            ]
-            .cpu()
-            .clone()
-            .tolist()
+        last_only = os.environ.get("SGLANG_LAST_PREFILL_HIDDEN_ONLY") == "1"
+        end = hidden_state_offset + (
+            req.extend_range.length if last_only else len(req.origin_input_ids)
         )
+        values = logits_output.hidden_states[hidden_state_offset:end]
+        # Offline tree-search clients need only the final prefill vector used
+        # to produce next-token logits. Avoid serializing O(context * hidden)
+        # Python floats for every 16k/32k branch request. This opt-in preserves
+        # the public return_hidden_states contract for every normal server.
+        if last_only:
+            values = values[-1:]
+        req.hidden_states.append(values.cpu().clone().tolist())
+        hidden_state_offset = end
         return hidden_state_offset
 
     def _apply_prefill_grammar(self, *, req: Req, next_token_id: int) -> None:
