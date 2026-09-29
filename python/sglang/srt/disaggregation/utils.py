@@ -529,17 +529,20 @@ class MetadataBuffers:
             self.output_token_sampling_logprobs[
                 req.metadata_buffer_index, : len(chunk.logprobs)
             ].copy_(torch.from_numpy(chunk.logprobs))
-        # For PD + spec decode
-        if req.hidden_states_tensor is not None:
+        # For PD + spec decode. spec-dec-opt: top-k is copied whenever it was set,
+        # so a token-only STANDALONE draft (no hidden states) still ships it.
+        if req.output_topk_p is not None and (
+            req.hidden_states_tensor is not None or req.output_topk_index is not None
+        ):
             # speculative_eagle_topk should not be greater than 16 currently
             topk = req.output_topk_p.size(0)
-
             self.output_topk_p[req.metadata_buffer_index, :topk].copy_(
                 req.output_topk_p
             )
             self.output_topk_index[req.metadata_buffer_index, :topk].copy_(
                 req.output_topk_index
             )
+        if req.hidden_states_tensor is not None:
             self.output_hidden_states[req.metadata_buffer_index].copy_(
                 req.hidden_states_tensor
             )

@@ -891,7 +891,18 @@ class SchedulerDisaggregationPrefillMixin:
 
                 self.cache_unfinished_disagg_prefill(req)
                 self.disagg_prefill_inflight_queue.append(req)
-                if self.spec_algorithm.is_eagle() and draft_input is not None:
+                if (
+                    self.spec_algorithm.is_standalone()
+                    and draft_input is not None
+                    and draft_hidden_states_cpu is None
+                ):
+                    # spec-dec-opt: STANDALONE is token-only. It still needs the first
+                    # draft step's top-k on the decode side, but has no hidden states.
+                    req.output_topk_p = draft_input.topk_p[i]
+                    req.output_topk_index = draft_input.topk_index[i]
+                    req.hidden_states_tensor = None
+                    req.output_dsa_topk_indices = None
+                elif self.spec_algorithm.is_eagle() and draft_input is not None:
                     req.output_topk_p = draft_input.topk_p[i]
                     req.output_topk_index = draft_input.topk_index[i]
                     req.hidden_states_tensor = draft_hidden_states_cpu[i].clone()

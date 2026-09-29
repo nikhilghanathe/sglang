@@ -52,9 +52,16 @@ def build_eagle_disagg_draft_input(
         dim=0,
     )
 
-    hidden_states = torch.stack(
-        [req.hidden_states_tensor for req in batch.reqs], dim=0
-    ).to(batch.device)
+    from sglang.srt.speculative.eagle_utils import draft_carries_hidden_states
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    if draft_carries_hidden_states(SpeculativeAlgorithm.from_string(spec.speculative_algorithm)):
+        hidden_states = torch.stack(
+            [req.hidden_states_tensor for req in batch.reqs], dim=0
+        ).to(batch.device)
+    else:
+        # STANDALONE: token-only draft; the decode-side buffer holds only padding.
+        hidden_states = None
 
     dsa_topk_indices = None
     dsa_indices_list = [req.output_dsa_topk_indices for req in batch.reqs]

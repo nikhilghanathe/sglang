@@ -204,7 +204,10 @@ class SpeculativeAlgorithm(Enum):
         last_tokens_tensor: torch.Tensor,
         future_map: FutureMap,
     ) -> Optional[SpecInput]:
-        if self.is_eagle():
+        # spec-dec-opt: STANDALONE shares EAGLE's draft-input shape (top-k, no hidden
+        # states), so it uses the same builder; without this it returned None and the
+        # first decode draft crashed on an empty top-k.
+        if self.is_eagle() or self.is_standalone():
             from sglang.srt.speculative.eagle_disaggregation import (
                 build_eagle_disagg_draft_input,
             )
