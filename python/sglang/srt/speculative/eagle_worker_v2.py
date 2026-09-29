@@ -868,7 +868,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else contextlib.nullcontext()
         )
 
-        with canary_outside_ctx, spec_phase_timer.record("draft"):
+        with canary_outside_ctx, spec_phase_timer.record("draft", bucket=len(batch.reqs)):
             # Run draft
             if can_run_decode_cuda_graph:
                 parent_list, top_scores_index, draft_tokens, draft_probs = (

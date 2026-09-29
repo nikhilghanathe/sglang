@@ -4,6 +4,8 @@ import os
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+
+from sglang.srt.speculative import spec_phase_timer
 import torch.distributed as dist
 
 from sglang.kernels.ops.speculative.cache_locs import (
@@ -2399,6 +2401,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         device = self.device
 
         # --- 1) Draft a fixed block with the draft model.
+        _t_draft = spec_phase_timer.start("draft")
         target_model = self.target_worker.model_runner.model
         embed_module = unwrap_lora_layer(
             _resolve_dflash_embedding_module(self.draft_model, target_model)
@@ -2708,6 +2711,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
         )
 
+        spec_phase_timer.stop(_t_draft, bucket=bs)
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
@@ -2761,12 +2765,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().enable_dp_attention and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
+        _t_verify = spec_phase_timer.start("target_forward")
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=True if not _is_npu else None,
         )
+        spec_phase_timer.stop(_t_verify, bucket=bs)
+        _t_accept = spec_phase_timer.start("accept")
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
 
@@ -2860,7 +2867,11 @@ class DFlashWorkerV2(BaseSpecWorker):
         if on_publish is not None:
             on_publish(new_seq_lens)
 
+        spec_phase_timer.stop(_t_accept, bucket=bs)
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
+        # (timed separately: this target-feature ingestion is what an off-GPU drafter
+        # would need shipped across the link every cycle)
+        _t_append = spec_phase_timer.start("draft_kv_append")
         hidden = logits_output.hidden_states
         if hidden is None:
             raise RuntimeError(
@@ -2876,6 +2887,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             commit_lens=commit_lens,
         )
 
+        spec_phase_timer.stop(_t_append, bucket=bs)
         # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
         logits_output.hidden_states = None
 

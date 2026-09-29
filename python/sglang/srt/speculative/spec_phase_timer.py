@@ -157,6 +157,34 @@ def record(phase: str, bucket=None):
             _write()  # write incrementally: worker is killed by signal, atexit may not fire
 
 
+def start(phase: str):
+    """Begin timing a phase that spans code awkward to wrap in `with record(...)`.
+
+    Returns an opaque token for stop(); None when timing is off or the stream is being
+    captured, in which case stop() is a no-op. Same validity rules as record().
+    """
+    if not enabled() or _capturing():
+        return None
+    ev = torch.cuda.Event(enable_timing=True)
+    ev.record()
+    return (phase, ev)
+
+
+def stop(token, bucket=None) -> None:
+    """End a phase begun with start(). No-op for a None token."""
+    if token is None or _capturing():
+        return
+    phase, s = token
+    e = torch.cuda.Event(enable_timing=True)
+    e.record()
+    pending = _PENDING.setdefault(phase, [])
+    pending.append((s, e))
+    _PENDING_BUCKETS.setdefault(phase, []).append(bucket)
+    if len(pending) >= _FLUSH_EVERY:
+        _fold(phase)
+        _write()
+
+
 def _fold(phase: str) -> None:
     pending = _PENDING.get(phase)
     if not pending:
